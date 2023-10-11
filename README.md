@@ -1,6 +1,6 @@
 # literate-flatbush
 
-At commit `370221743e30dccde864ec45630ca018c7f3e867`:
+At commit `4ab68d7e11607dba0e814efe50fb3583c69f90d6`:
 
 Note: have a published "literate" version at multiple git tags, as well as a "main/index.html". At the top of the file, have a "versions" section that references/links to each of these commits.
 
@@ -12,7 +12,7 @@ Before diving into the code, I want to provide a high level overview of how this
 
 Flatbush is a really interesting R-Tree implementation because:
 
-- Elegant, concise algorithm. Under 350 lines of code, excluding comments.
+- Elegant, concise algorithm. Only 277 lines of code, excluding comments and blank lines, according to `cloc`.
 - used as the basis for other projects like FlatGeobuf
 - really fast
 - really compact and memory efficient

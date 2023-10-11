@@ -407,14 +407,37 @@ export default class Flatbush {
     // As elsewhere, `pos` is a local variable that points to a coordinate
     // within a box at the given level `i` of the tree.
     for (let i = 0, pos = 0; i < this._levelBounds.length - 1; i++) {
-      // Next, we want to scan through
-      const end = this._levelBounds[i];
 
-      // generate a parent node for each block of consecutive <nodeSize> nodes
+      // Next, we want to scan through all nodes at this level of the tree,
+      // generating a parent node for each block of consecutive `nodeSize`
+      // nodes.
+      //
+      // Here, `end` is index of the first coordinate at the _next level above
+      // the current level_. Therefore, all index values in the range up until
+      // but excluding `end` refer to box coordinates at the current level of
+      // the tree.
+      //
+      // We then scan over all of these box coordinates in this while loop.
+      const end = this._levelBounds[i];
       while (pos < end) {
+        // The node index (which will later get set in the `indices` array) is
+        // defined to be the pointer to the first element of a box.
         const nodeIndex = pos;
 
-        // calculate bbox for the new node
+        // Calculate the bounding box for the new parent node.
+        //
+        // We initialize the bounding box to the first box and then expand the
+        // box while looping over the rest of the elements that together are the
+        // children of this parent node we're creating.
+        //
+        // Note the `j = 1` in the loop; this is a small optimization because we
+        // initialize the `node*` variables to the first element.
+        //
+        // Also note that in the loop we constrain the iteration variable `j` to
+        // be both less than the node size and for `pos < end`. The former
+        // ensures we have only a maximum of `nodeSize` elements informing the
+        // parent node's boundary. The latter ensures that we don't accidentally
+        // overflow the current tree level.
         let nodeMinX = boxes[pos++];
         let nodeMinY = boxes[pos++];
         let nodeMaxX = boxes[pos++];
@@ -426,7 +449,26 @@ export default class Flatbush {
           nodeMaxY = Math.max(nodeMaxY, boxes[pos++]);
         }
 
-        // add the new node to the tree data
+        // Now that we know the extent of the parent node, we can add the new
+        // node's information to the tree data.
+        //
+        // **TODO**: think a bit more/describe how the
+        //
+        // ```js
+        // this._indices[this._pos >> 2] = nodeIndex;
+        // ```
+        //
+        // line works... in particular how is `_indices` laid out across levels?
+        // Can you create a diagram of this?
+        //
+        // Note that we're setting the parent node into `this._indices` and
+        // `boxes` according to `this._pos`, which **is a different variable
+        // than the local `pos` variable that's incremented in this loop.**
+        //
+        // Incredulously, these loops do all the hard work of constructing the
+        // tree! That's it! The structure of the tree and the coordinates of all
+        // the parent nodes are now fully contained within `this._indices` and
+        // `boxes`, which are both array views on `this.data`!
         this._indices[this._pos >> 2] = nodeIndex;
         boxes[this._pos++] = nodeMinX;
         boxes[this._pos++] = nodeMinY;
@@ -436,6 +478,7 @@ export default class Flatbush {
     }
   }
 
+  // ### Flatbush.search
   /**
    * Search the index by a bounding box.
    * @param {number} minX
@@ -636,8 +679,8 @@ function swap(values, boxes, indices, i, j) {
   indices[j] = e;
 }
 
-// This is the function that takes a position in 2D space, x and y, and returns
-// the hilbert value for that position.
+// This is the function that takes a position in 2D space, `x` and `y`, and
+// returns the hilbert value for that position.
 //
 // Umm yeah sorry I can't say anything else about this... it's black magic.
 //
