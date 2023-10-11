@@ -1,5 +1,8 @@
 {
   "dependencies": {
     "docco": "^0.9.1"
+  },
+  "scripts": {
+    "build": "docco index.js"
   }
 }
