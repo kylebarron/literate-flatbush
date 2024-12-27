@@ -14,13 +14,14 @@
 // No code modifications are made in this fork. Only comments are added.
 //
 //
+// I've written _two_ ports of Flatbush now. A stable, fast, implementation in Rust and an original one in Cython.
 //
 //
 //
 //
 //
-//
-//
+// All credit for this code goes to Volodymyr Agafonkin under the XX license.
+// Any errors in explanation are mine alone.
 
 import FlatQueue from "flatqueue";
 
@@ -136,10 +137,12 @@ export default class Flatbush {
     // know the amount of bytes to allocate for each level of the tree.
     //
     // `_levelBounds` is an array that stores the offset within the boxes array
-    // where each level **ends**. The first element of `_levelBounds` is `n *
-    // 4`, meaning that from `0` to `n * 4` contains the bottom (leaves) of the
+    // where each level **ends**. The first element of `_levelBounds` is `numItems *
+    // 4`, meaning that from `0` to `numItems * 4` contains the bottom (leaves) of the
     // tree. Then from `_levelBounds[0]` to `_levelBounds[1]` represents the
-    // next level of the tree.
+    // first level of the tree, that is, the direct parent nodes of the leaves.
+    // And so on, `_levelBounds[1]` to `_levelBounds[2]` represents the nodes at
+    // level 2, the grandparent nodes of the leaf nodes.
     //
     // So for example if `numItems` is 10,000 and `nodeSize` is 16,
     // `levelBounds` will be:
@@ -148,15 +151,15 @@ export default class Flatbush {
     // ```
     //
     // That is:
-    // - 10,000 leaves
-    // - 625 nodes one level higher
-    // - 40 nodes two levels higher
-    // - 3 nodes three levels higher
-    // - 1 node four levels higher (at the top of the tree)
+    // - The first 40,000 elements are coordinates of the leaf nodes (4 coords per node). So there are 10,000 leaves.
+    // - 2,500 coordinates and 625 nodes one level higher
+    // - 160 coordinates and 40 nodes two levels higher
+    // - 12 coordinates and 3 nodes three levels higher
+    // - 1 root node four levels higher, at the top of the tree, with a single 4-coordinate box.
     //
-    // Keep in mind that every node within a single tree level will be
-    // completely full (contain exactly `nodeSize` elements) except for the last
-    // node.
+    // Keep in mind that because this is a _packed_ tree, every node within a
+    // single level will be **completely full** (contain exactly `nodeSize`
+    // elements) except for the last node.
     //
     // `numNodes` ends up as the total number of nodes in the tree, including
     // all leaves.
@@ -178,6 +181,8 @@ export default class Flatbush {
     this.ArrayType = ArrayType;
     this.IndexArrayType = numNodes < 16384 ? Uint16Array : Uint32Array;
 
+    // In order to accurately interpret the index from raw bytes, we need to
+    // record in the header which index type we're using.
     const arrayTypeIndex = ARRAY_TYPES.indexOf(this.ArrayType);
 
     // The number of bytes needed to store all box coordinate data for all
@@ -223,14 +228,14 @@ export default class Flatbush {
       this.maxX = this._boxes[this._pos - 2];
       this.maxY = this._boxes[this._pos - 1];
 
-    // In the `else` case, a `data` buffer was not provided, and we need to
-    // allocate data for the backing buffer.
-    //
-    // `this.data` is a new `ArrayBuffer` with space for the header plus all box
-    // data plus all index data. Then `this._boxes` is created as a view on
-    // `this.data` starting after the header and with `numNodes * 4` elements.
-    // `this._indices` is created as a view on `this.data` starting after the
-    // end of `this._boxes`.
+      // In the `else` case, a `data` buffer was not provided, and we need to
+      // allocate data for the backing buffer.
+      //
+      // `this.data` is a new `ArrayBuffer` with space for the header plus all box
+      // data plus all index data. Then `this._boxes` is created as a view on
+      // `this.data` starting after the header and with `numNodes * 4` elements.
+      // `this._indices` is created as a view on `this.data` starting after the
+      // end of `this._boxes`.
     } else {
       this.data = new ArrayBufferType(
         8 + nodesByteSize + numNodes * this.IndexArrayType.BYTES_PER_ELEMENT
@@ -257,6 +262,13 @@ export default class Flatbush {
       this.maxY = -Infinity;
 
       // These lines set the header values with metadata from the instance.
+      //
+      // The first byte, `0xfb` is a "magic byte", used as basic validation that
+      // this buffer is indeed a Flatbush index.
+      //
+      // Since arrayTypeIndex is known to have only 9 values, it doesn't need to
+      // take up a a full byte. Here it shares a single byte with the Flatbush
+      // format version.
       new Uint8Array(this.data, 0, 2).set([
         0xfb,
         (VERSION << 4) + arrayTypeIndex,
@@ -281,19 +293,26 @@ export default class Flatbush {
    * @returns {number} A zero-based, incremental number that represents the newly added rectangle.
    */
   add(minX, minY, maxX, maxY) {
-    // We want to know the positional index of the box presently being added.
+    // We want to know the insertion index of the box presently being added.
     //
     // In the `constructor`, `this._pos` is initialized to `0` and in each call
     // to `add()`, `this._pos` is incremented by `4`. So dividing `this._pos` by
     // `4` retrieves the 0-based index of the box about to be inserted. Using
     // bit shifts is a performance optimization.
+    //
+    // Because there are 4 values for each item, using `_pos` is an easy way to
+    // infer the insertion index without having to keep track of a separate
+    // counter.
     const index = this._pos >> 2;
     const boxes = this._boxes;
 
     // We set the value of `this._indices` at the position `index` to the value
-    // of the current index. Later, inside the `finish` method, we'll sort the
-    // boxes by their hilbert value and jointly reorder the values in
-    // `_indices`.
+    // of the current index.
+    //
+    // So `this._indices` stores the insertion index of each box.
+    //
+    // Later, inside the `finish` method, we'll sort the boxes by their hilbert
+    // value and jointly reorder the values in `_indices`.
     //
     // **Invariant:** This means that for any box at position `i` (where `i`
     // points to a _box_ not a _coordinate_ inside a box), `this._indices[i]`
@@ -318,7 +337,7 @@ export default class Flatbush {
     boxes[this._pos++] = maxX;
     boxes[this._pos++] = maxY;
 
-    // Update the total bounds of this instance if this rectangle is larger
+    // Update the total bounds of this instance if this rectangle is larger than the existing bounds.
     if (minX < this.minX) this.minX = minX;
     if (minY < this.minY) this.minY = minY;
     if (maxX > this.maxX) this.maxX = maxX;
@@ -407,7 +426,6 @@ export default class Flatbush {
     // As elsewhere, `pos` is a local variable that points to a coordinate
     // within a box at the given level `i` of the tree.
     for (let i = 0, pos = 0; i < this._levelBounds.length - 1; i++) {
-
       // Next, we want to scan through all nodes at this level of the tree,
       // generating a parent node for each block of consecutive `nodeSize`
       // nodes.
@@ -489,15 +507,33 @@ export default class Flatbush {
    * @returns {number[]} An array of indices of items intersecting or touching the given bounding box.
    */
   search(minX, minY, maxX, maxY, filterFn) {
+    // A simple check to see if this index has been finished/sorted or not.
+    // Calling `search` on an unsorted index would "work" but miss out on the
+    // intended speed ups of the index.
     if (this._pos !== this._boxes.length) {
       throw new Error("Data not yet indexed - call index.finish().");
     }
 
+    // `nodeIndex` is initialized to the root node. The root node is the last
+    // node in `this._boxes`. We subtract `4` so that `nodeIndex` points to the
+    // first coordinate of the box.
+    //
+    // `queue` holds integers that represent the `pos` of internal nodes that
+    // still need to be searched. That is, where the parent node of the node
+    // represented by `pos` intersected the search predicate.
+    //
+    // `results` holds integers that represent the insertion indexes of index rows
+    // that match the search predicate.
     /** @type number | undefined */
     let nodeIndex = this._boxes.length - 4;
     const queue = [];
     const results = [];
 
+    // Now we have our search loop.
+    //
+    // `while (nodeIndex !== undefined)` will be `true` as long as there are
+    // still elements remaining in `queue` (note that the last line of the
+    // `while` loop is `nodeIndex = queue.pop();`).
     while (nodeIndex !== undefined) {
       // find the end index of the node
       const end = Math.min(
@@ -513,6 +549,21 @@ export default class Flatbush {
         if (minX > this._boxes[pos + 2]) continue; // minX > nodeMaxX
         if (minY > this._boxes[pos + 3]) continue; // minY > nodeMaxY
 
+        // `pos` is a pointer to the first coordinate of a given node.
+        // `pos` has multiple purposes. In the
+        //
+        // `pos >> 2` is a faster way of expressing `pos / 4`, where we can
+        // inform the JS engine that the output will be an integer.
+        //
+        // - If the current node _is not_ a leaf node, `index` is the `pos` of
+        //   the first child node. This is a node that we should evaluate later,
+        //   so we add it to the `queue` array.
+        // - If the current node _is_ a leaf node, then `index` is the original
+        //   insertion index, and we add it to the `results` array.
+        //
+        // Each box has 4 coordinates, and recall that the
+        //
+        // I believe `| 0` is just a JS engine optimization.
         const index = this._indices[pos >> 2] | 0;
 
         if (nodeIndex >= this.numItems * 4) {
