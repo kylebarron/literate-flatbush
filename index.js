@@ -1,4 +1,5 @@
 // # Literate Flatbush
+// ## Understanding a fast, elegant RTree implementation
 //
 // [Kyle Barron](https://kylebarron.dev/) \
 // January 1, 2025
@@ -6,6 +7,7 @@
 // Spatial indexes are a tried and true part of geospatial software engineering that speed up queries. But ever wondered how an RTree is actually implemented?
 //
 // TODO: fix this intro.
+// TODO: somewhere in intro explain what a hilbert curve is.
 //
 // This post is a ["literate"](https://en.wikipedia.org/wiki/Literate_programming) fork of Flatbush, a blazing-fast, memory-efficient RTree. Documentation and code are interspersed, letting you follow along with the code.
 //
@@ -57,9 +59,9 @@
 // [`docco`](https://ashkenas.com/docco/) converts the file into a rendered HTML
 // file. No code modifications are made in this fork. Only comments are added.
 //
-// All credit for this code goes to Volodymyr Agafonkin in his [`flatbush`][]
-// project, forked here under the ISC license. Any errors in explanation are
-// mine alone.
+// All credit for this code goes to Volodymyr Agafonkin and contributors to the
+// [`flatbush`][] project, forked here under the ISC license. Any errors in
+// explanation are mine alone.
 //
 // [`flatbush`]: https://github.com/mourner/flatbush
 
@@ -268,8 +270,9 @@ export default class Flatbush {
       // that box.
       //
       // We also set `this._pos` as the total number of coordinates. `this._pos`
-      // is internal state of the class while building that allows for inferring
-      // whether the `Flatbush` instance has been "finished" (sorted) or not.
+      // is a pointer into the `this._boxes` array, used while adding new boxes
+      // to the instance. This also allows for inferring whether the `Flatbush`
+      // instance has been "finished" (sorted) or not.
       //
       // If the instance has already been sorted, it's impermissible to add more
       // data. If the instance has not yet been sorted, query methods may not
@@ -351,31 +354,41 @@ export default class Flatbush {
   add(minX, minY, maxX, maxY) {
     // We need to know the insertion index of the box presently being added.
     //
-    // In the `constructor`, `this._pos` is initialized to `0` and in each call
-    // to `add()`, `this._pos` is incremented by `4`. So dividing `this._pos` by
-    // `4` retrieves the 0-based index of the box about to be inserted. Using
-    // bit shifts is a performance optimization.
+    // In the constructor, `this._pos` is initialized to `0` and in each call
+    // to `add()`, `this._pos` is incremented by `4`. Dividing `this._pos` by
+    // `4` retrieves the 0-based index of the box about to be inserted.
+    //
+    // This bit shift:
+    // ```js
+    // this._pos >> 2
+    // ```
+    // is equivalent to
+    // ```js
+    // this._pos / 4
+    // ```
+    // but the bit shift is faster because it informs the JS engine that we
+    // expect the output to be an integer.
     //
     // Because there are 4 values for each item, using `_pos` is an easy way to
-    // infer the insertion index without having to keep track of a separate
-    // counter.
+    // infer the insertion index without having to maintain a separate counter.
     const index = this._pos >> 2;
     const boxes = this._boxes;
 
-    // We set the value of `this._indices` at the position `index` to the value
-    // of the current index.
-    //
-    // So `this._indices` stores the insertion index of each box.
+    // We set the value of `this._indices` at the current index's position to
+    // the value of the current index. So `this._indices` stores the insertion
+    // index of each box.
     //
     // Later, inside the `finish` method, we'll sort the boxes by their hilbert
-    // value and jointly reorder the values in `_indices`.
+    // value and jointly reorder the values in `_indices`, ensuring that we keep
+    // the indices and boxes in sync.
     //
-    // **Invariant:** This means that for any box at position `i` (where `i`
-    // points to a _box_ not a _coordinate_ inside a box), `this._indices[i]`
-    // retrieves the original insertion-order index of that box.
+    // This means that for any box representing a leaf node at position `i`
+    // (where `i` points to a _box_ not a _coordinate_ inside a box),
+    // `this._indices[i]` retrieves the original insertion-order index of that
+    // box.
     this._indices[index] = index;
 
-    // We add the coordinates of this box into the `boxes` array. Note that
+    // We set the coordinates of this box into the `boxes` array. Note that
     // `this._pos++` is evaluated **after** the box index is set. So
     //
     // ```js
@@ -393,7 +406,8 @@ export default class Flatbush {
     boxes[this._pos++] = maxX;
     boxes[this._pos++] = maxY;
 
-    // Update the total bounds of this instance if this rectangle is larger than the existing bounds.
+    // Update the total bounds of this instance if this rectangle is larger than
+    // the existing bounds.
     if (minX < this.minX) this.minX = minX;
     if (minY < this.minY) this.minY = minY;
     if (maxX > this.maxX) this.maxX = maxX;
@@ -403,11 +417,15 @@ export default class Flatbush {
   }
 
   // ### Flatbush.finish
+  //
+  // TODO: explain high level of sorting by hilbert curve.
+  //
   /** Perform indexing of the added rectangles. */
   finish() {
     // Recall that in the `add` method, we increment `this._pos` by `1` for each
     // coordinate of each box. Here we validate that we've added the same number
-    // of boxes as we provisioned in the constructor.
+    // of boxes as we provisioned in the constructor. Remember that `>> 2` is
+    // equivalent to `/ 4`.
     if (this._pos >> 2 !== this.numItems) {
       throw new Error(
         `Added ${this._pos >> 2} items when expected ${this.numItems}.`
@@ -418,7 +436,7 @@ export default class Flatbush {
     // If the total number of items in the tree is less than the node size, that
     // means we'll only have a single non-leaf node in the tree. In that case,
     // we don't even need to sort by hilbert value. We can just assign the total
-    // bounds of the tree to the following box and end.
+    // bounds of the tree to the following box and return.
     if (this.numItems <= this.nodeSize) {
       boxes[this._pos++] = this.minX;
       boxes[this._pos++] = this.minY;
@@ -427,17 +445,17 @@ export default class Flatbush {
       return;
     }
 
-    // Compute the height and width of the total bounds of the tree and
-    // instantiate space for the hilbert values.
+    // Using the total bounds of the tree, we compute the height and width of
+    // the hilbert space and instantiate space for the hilbert values.
     const width = this.maxX - this.minX || 1;
     const height = this.maxY - this.minY || 1;
     const hilbertValues = new Uint32Array(this.numItems);
     const hilbertMax = (1 << 16) - 1;
 
     // Map box centers into Hilbert coordinate space and calculate Hilbert
-    // values using the `hilbert` utility function.
+    // values using the `hilbert` function defined below.
     //
-    // This for loop iterates over every box, so at the beginning of each loop
+    // This for loop iterates over every box. At the beginning of each loop
     // iteration, `pos` is equal to `i * 4`.
     for (let i = 0, pos = 0; i < this.numItems; i++) {
       const minX = boxes[pos++];
@@ -457,6 +475,14 @@ export default class Flatbush {
     // still in _insertion order_. We need to jointly sort the boxes and indices
     // according to their hilbert values, which we do in this `sort` utility,
     // documented below.
+    //
+    // Note that this canonical implementation chooses to sort based on hilbert
+    // value, but that's actually not necessary to maintain ABI-stability. Any
+    // two-dimensional sort will work. My [Rust
+    // port](https://github.com/kylebarron/geo-index) defines an [extensible
+    // trait](https://docs.rs/geo-index/latest/geo_index/rtree/sort/trait.Sort.html)
+    // for sorting and provides an implementation of [sort-tile-recursive
+    // sorting](https://ia600900.us.archive.org/27/items/nasa_techdoc_19970016975/19970016975.pdf).
     sort(
       hilbertValues,
       boxes,
@@ -469,9 +495,11 @@ export default class Flatbush {
     // Now the leaves of the tree have been sorted, but we still need to
     // construct the rest of the tree.
     //
-    // For each level of the tree, we need to generate nodes that contain
+    // For each level of the tree, we need to generate parent nodes that contain
     // `nodeSize` child nodes. We do this starting from the leaves, working from
     // the bottom up.
+    //
+    // TODO: resume careful proofreading from here.
     //
     // Here the iteration variable, `i`, refers to the index into the
     // `this._levelBounds` array, which is also the positional level of the
@@ -539,10 +567,10 @@ export default class Flatbush {
         // `boxes` according to `this._pos`, which **is a different variable
         // than the local `pos` variable that's incremented in this loop.**
         //
-        // Incredulously, these loops do all the hard work of constructing the
+        // Impressively, these loops do all the hard work of constructing the
         // tree! That's it! The structure of the tree and the coordinates of all
         // the parent nodes are now fully contained within `this._indices` and
-        // `boxes`, which are both array views on `this.data`!
+        // `boxes`, which are both views on `this.data`!
         this._indices[this._pos >> 2] = nodeIndex;
         boxes[this._pos++] = nodeMinX;
         boxes[this._pos++] = nodeMinY;
@@ -563,9 +591,7 @@ export default class Flatbush {
    * @returns {number[]} An array of indices of items intersecting or touching the given bounding box.
    */
   search(minX, minY, maxX, maxY, filterFn) {
-    // A simple check to see if this index has been finished/sorted or not.
-    // Calling `search` on an unsorted index would "work" but miss out on the
-    // intended speed ups of the index.
+    // A simple check to ensure that this index has been finished/sorted.
     if (this._pos !== this._boxes.length) {
       throw new Error("Data not yet indexed - call index.finish().");
     }
@@ -645,6 +671,7 @@ export default class Flatbush {
    * @returns {number[]} An array of indices of items found.
    */
   neighbors(x, y, maxResults = Infinity, maxDistance = Infinity, filterFn) {
+    // A simple check to ensure that this index has been finished/sorted.
     if (this._pos !== this._boxes.length) {
       throw new Error("Data not yet indexed - call index.finish().");
     }
@@ -694,6 +721,10 @@ export default class Flatbush {
   }
 }
 
+// The remaining code is "just" utility functions.
+//
+// I won't document these because they tend to be self explanatory and this post
+// is focused more on the RTree implementation itself.
 /**
  * 1D distance from a value to a range.
  * @param {number} k
@@ -723,6 +754,7 @@ function upperBound(value, arr) {
   return arr[i];
 }
 
+// `sort`: Custom quicksort that partially sorts bbox data alongside the hilbert values.
 /**
  * Custom quicksort that partially sorts bbox data alongside the hilbert values.
  * @param {Uint32Array} values
@@ -752,6 +784,7 @@ function sort(values, boxes, indices, left, right, nodeSize) {
   sort(values, boxes, indices, j + 1, right, nodeSize);
 }
 
+// `swap`: Swap two values and two corresponding boxes.
 /**
  * Swap two values and two corresponding boxes.
  * @param {Uint32Array} values
@@ -786,6 +819,8 @@ function swap(values, boxes, indices, i, j) {
   indices[j] = e;
 }
 
+// `hilbert`: compute hilbert codes.
+//
 // This is the function that takes a position in 2D space, `x` and `y`, and
 // returns the hilbert value for that position.
 //
