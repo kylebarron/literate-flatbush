@@ -3,6 +3,7 @@
     "docco": "^0.9.1"
   },
   "scripts": {
-    "build": "docco index.js"
+    "build": "docco index.js",
+    "watch": "fswatch -o index.js | xargs -n1 -I{} yarn docco index.js"
   }
 }

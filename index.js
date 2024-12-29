@@ -1,32 +1,73 @@
 // # Literate Flatbush
 //
+// [Kyle Barron](https://kylebarron.dev/) \
+// January 1, 2025
 //
-// Some overall structure to go over before diving into the code
+// Spatial indexes are a tried and true part of geospatial software engineering that speed up queries. But ever wondered how an RTree is actually implemented?
 //
-// #### single data buffer
+// TODO: fix this intro.
 //
-// ##
+// This post is a ["literate"](https://en.wikipedia.org/wiki/Literate_programming) fork of Flatbush, a blazing-fast, memory-efficient RTree. Documentation and code are interspersed, letting you follow along with the code.
+//
+// The code in this particular post is in JavaScript, because that's what the canonical implementation uses. But it's the _algorithm_ that's important here, so don't get too caught up in the JavaScript.
+//
+// ## Overview
+//
+// The Flatbush algorithm generates a **static, packed, ABI-stable RTree**.
+// Let's break that down:
+//
+// - [**RTree**](https://en.wikipedia.org/wiki/R-tree): a [spatial
+//   index](https://blog.mapbox.com/a-dive-into-spatial-search-algorithms-ebd0c5e39d2a)
+//   for storing geospatial vector data that allows for fast spatial queries.
+//
+//   It's a form of a
+//   ["tree"](https://en.wikipedia.org/wiki/Tree_(abstract_data_type)), where
+//   there's one root node that has `nodeSize` children. Each of those nodes
+//   have their own `nodeSize` children, and so on. The tree structure allows
+//   you to avoid superfluous checks and quickly find matching candidates for
+//   your query. In particular, an RTree stores a _bounding box_ for each
+//   geometry.
+// - **static**: the index is immutable. All geometries need to be added to the index before any searches can be done. Geometries can't be added to an existing index later.
+// - **packed**: all nodes are at full capacity (except for the last node at each tree level). Because the tree is static, we don't need to reserve space in each node for future additions. This improves memory efficiency.
+// - **ABI-stable**: the underlying binary memory layout is stable. This enables zero-copy sharing between threads or, in my Rust port, between Rust and Python.
+//
+// There are a few really nice features about this algorithm, and why it makes
+// sense to document it like this:
+//
+// - **Speed**: This is likely the fastest static spatial index in JavaScript. Ports of the algorithm are among the fastest spatial indexes in other languages, too.
+// - **Single, contiguous underlying buffer**: The index is contained in a single `ArrayBuffer`, which makes it easy to share across multiple threads or persist and use later.
+// - **Memory-efficiency**: because the index is fully packed, it's highly memory efficient.
+// - **Bounded-memory**: for any given number of items and node size, you can infer the total memory that will be used by the RTree.
+// - **Simple and elegant**: The JavaScript implementation is just a few hundred lines of code, and in my opinion it's quite elegant how the structure of the tree implicitly maintains the insertion index.
+//
+// Keep in mind there are a few restrictions as well:
+//
+// - Only two-dimensional data. Because the algorithm uses powers of two, only two-dimensional data is supported.
 //
 //
 //
-// Incredibly elegant algorithm.
+// I've written _two_ ports of Flatbush. I originally explored a (now-archived)
+// [Cython port](https://github.com/kylebarron/pyflatbush) but deprecated that
+// in favor of writing a [stable, fast, implementation in
+// Rust](https://github.com/kylebarron/geo-index), with [Python
+// bindings](https://github.com/kylebarron/geo-index/tree/main/python).
 //
-// No code modifications are made in this fork. Only comments are added.
+// This is a "literate" fork of the [`flatbush`][] library. Markdown-formatted
+// comments are written in the code, and then
+// [`docco`](https://ashkenas.com/docco/) converts the file into a rendered HTML
+// file. No code modifications are made in this fork. Only comments are added.
 //
+// All credit for this code goes to Volodymyr Agafonkin in his [`flatbush`][]
+// project, forked here under the ISC license. Any errors in explanation are
+// mine alone.
 //
-// I've written _two_ ports of Flatbush now. A stable, fast, implementation in Rust and an original one in Cython.
-//
-//
-//
-//
-//
-// All credit for this code goes to Volodymyr Agafonkin under the XX license.
-// Any errors in explanation are mine alone.
+// [`flatbush`]: https://github.com/mourner/flatbush
 
 import FlatQueue from "flatqueue";
 
-// Flatbush supports a variety of `TypedArray` types store box coordinate data.
-// Flatbush uses `Float64Array` by default.
+// Flatbush supports a variety of
+// [`TypedArray`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray)
+// types store box coordinate data. Flatbush uses `Float64Array` by default.
 const ARRAY_TYPES = [
   Int8Array,
   Uint8Array,
@@ -55,7 +96,7 @@ export default class Flatbush {
   // One of Flatbush's goals is to support zero-copy usage, meaning that you can
   // take an `ArrayBuffer` backing a Flatbush index and
   // [_transfer_](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects)
-  // it to a Web Worker much faster than a [structured
+  // it between threads much faster than copying it via a [structured
   // clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm).
   // (Transfering is `O(1)` while cloning is `O(n)`.)
   //
@@ -77,11 +118,11 @@ export default class Flatbush {
     // The first 8 bytes of the Flatbush buffer contain a header with metadata
     // describing the contained index.
     //
-    // The first byte is a "magic byte" set to `0xfb`. The next byte contains 4
-    // bits for the format version and four bits for the array type. Then the
-    // next two bytes are a uint16-encoded number with the size of each node,
-    // and the last four bytes are a uint32-encoded number with the total number
-    // of items in the index.
+    // - byte 1: a "magic byte" set to `0xfb`.
+    // - byte 2: 4 bits for the serialized format version and four bits for the array type used for storing coordinates
+    // - byte 3-4: a uint16-encoded number representing the size of each node
+    // - byte 5-8: a uint32-encoded number representing the total number of
+    //   items in the index.
     const [magic, versionAndType] = new Uint8Array(data, 0, 2);
     if (magic !== 0xfb) {
       throw new Error("Data does not appear to be in a Flatbush format.");
@@ -106,9 +147,9 @@ export default class Flatbush {
 
   // ### Constructor
   //
-  // The Flatbush constructor initializes the memory space for a Flatbush tree
-  // given the number of items the tree will contain and the number of elements
-  // per tree node.
+  // The Flatbush constructor initializes the memory space (`ArrayBuffer`) for a
+  // Flatbush tree given the number of items the tree will contain and the
+  // number of elements per tree node.
   /**
    * Create a Flatbush index that will hold a given number of items.
    * @param {number} numItems
@@ -133,16 +174,20 @@ export default class Flatbush {
     this.nodeSize = Math.min(Math.max(+nodeSize, 2), 65535);
 
     // This do-while loop calculates the total number of nodes at each level of
-    // the R-tree (and thus also the total number of nodes). This is used to
-    // know the amount of bytes to allocate for each level of the tree.
+    // the R-tree (and thus also the total number of nodes). This will be used
+    // to know the amount of bytes to allocate for each level of the tree.
     //
-    // `_levelBounds` is an array that stores the offset within the boxes array
-    // where each level **ends**. The first element of `_levelBounds` is `numItems *
-    // 4`, meaning that from `0` to `numItems * 4` contains the bottom (leaves) of the
-    // tree. Then from `_levelBounds[0]` to `_levelBounds[1]` represents the
-    // first level of the tree, that is, the direct parent nodes of the leaves.
-    // And so on, `_levelBounds[1]` to `_levelBounds[2]` represents the nodes at
-    // level 2, the grandparent nodes of the leaf nodes.
+    // The tree is laid out in memory from bottom to top. `_levelBounds` is an
+    // array that stores the offset within the coordinates array where each
+    // level **ends**. The first element of `_levelBounds` is `n * 4`, meaning
+    // that the slice of the coordinates array from `0` to `n * 4` contains the
+    // bottom (leaves) of the tree.
+    //
+    // Then the slice of the coordinates array from `_levelBounds[0]` to
+    // `_levelBounds[1]` represents the first level of the tree, that is, the
+    // direct parent nodes of the leaves. And so on, `_levelBounds[1]` to
+    // `_levelBounds[2]` represents the nodes at level 2, the grandparent nodes
+    // of the leaf nodes.
     //
     // So for example if `numItems` is 10,000 and `nodeSize` is 16,
     // `levelBounds` will be:
@@ -151,7 +196,7 @@ export default class Flatbush {
     // ```
     //
     // That is:
-    // - The first 40,000 elements are coordinates of the leaf nodes (4 coords per node). So there are 10,000 leaves.
+    // - The first 40,000 elements are coordinates of the leaf nodes (4 coordinates per node). So there are 10,000 leaves.
     // - 2,500 coordinates and 625 nodes one level higher
     // - 160 coordinates and 40 nodes two levels higher
     // - 12 coordinates and 3 nodes three levels higher
@@ -172,12 +217,16 @@ export default class Flatbush {
       this._levelBounds.push(numNodes * 4);
     } while (n !== 1);
 
+    // Flatbush doesn't manage references to objects directly. Rather, it
+    // operates in terms of the _insertion index_. So Flatbush only internally
+    // maintains these insertion indices.
+    //
     // `IndexArrayType` will be used to create the `indices` array, to store the
     // ordering of the input boxes. If possible, a `Uint16Array` will be used to
-    // save space. If the values would overflow, a `Uint32Array` is used. The
-    // largest number a `Uint16Array` can hold is `2^16 = 65,536`. Since each
-    // node holds four values, this gets divided by `4` and `65,536 / 4 =
-    // 16,384`. This is why the check here is for 16,384.
+    // save space. If the values would overflow a `Uint16Array`, a `Uint32Array`
+    // is used. The largest number a `Uint16Array` can hold is `2^16 = 65,536`.
+    // Since each node holds four values, this gets divided by `4` and `65,536 /
+    // 4 = 16,384`. This is why the check here is for 16,384.
     this.ArrayType = ArrayType;
     this.IndexArrayType = numNodes < 16384 ? Uint16Array : Uint32Array;
 
@@ -195,14 +244,15 @@ export default class Flatbush {
 
     // This `if` statement switches on whether the `data` argument was passed in
     // (i.e. this constructor is called by `Flatbush.from`). If `data` exists,
-    // this will create the `_boxes` and `_indices` arrays as _views_ on the
+    // this will create the `_boxes` and `_indices` arrays as **views** on the
     // existing `ArrayBuffer` without allocating any new memory.
     if (data && data.byteLength !== undefined && !data.buffer) {
       this.data = data;
 
-      // `this._boxes` is created as a view on `this.data` starting after
-      // the header and with `numNodes * 4` elements. `this._indices` is created
-      // as a view on `this.data` starting after the end of `this._boxes`.
+      // `this._boxes` is created as a view on `this.data` starting after the
+      // header (8 bytes) and with `numNodes * 4` elements. `this._indices` is
+      // created as a view on `this.data` starting after the end of
+      // `this._boxes` and containing `numNodes` elements.
       this._boxes = new this.ArrayType(this.data, 8, numNodes * 4);
       this._indices = new this.IndexArrayType(
         this.data,
@@ -210,32 +260,34 @@ export default class Flatbush {
         numNodes
       );
 
-      // Recall that boxes in the `_boxes` array are stored from the leaves up.
+      // The coordinate data in the `_boxes` array is stored from the leaves up.
       // So the last box is the single node that contains all data. The index of
       // the last box is the four values in `_boxes` up to `numNodes * 4`.
       //
       // This sets the total bounds on the `Flatbush` instance to the extent of
       // that box.
       //
-      // Note that a side effect here is that `this._pos` is also set to the end
-      // of the nodes array. `this._pos` is internal state of the class that
-      // allows for inferring whether the `Flatbush` instance has been
-      // "finished" or not. With this value of `this._pos`, `search()` will not
-      // throw.
+      // We also set `this._pos` as the total number of coordinates. `this._pos`
+      // is internal state of the class while building that allows for inferring
+      // whether the `Flatbush` instance has been "finished" (sorted) or not.
+      //
+      // If the instance has already been sorted, it's impermissible to add more
+      // data. If the instance has not yet been sorted, query methods may not
+      // be called.
       this._pos = numNodes * 4;
       this.minX = this._boxes[this._pos - 4];
       this.minY = this._boxes[this._pos - 3];
       this.maxX = this._boxes[this._pos - 2];
       this.maxY = this._boxes[this._pos - 1];
 
-      // In the `else` case, a `data` buffer was not provided, and we need to
+      // In the `else` case, a `data` buffer was not provided, so we need to
       // allocate data for the backing buffer.
       //
-      // `this.data` is a new `ArrayBuffer` with space for the header plus all box
-      // data plus all index data. Then `this._boxes` is created as a view on
-      // `this.data` starting after the header and with `numNodes * 4` elements.
-      // `this._indices` is created as a view on `this.data` starting after the
-      // end of `this._boxes`.
+      // `this.data` is a new `ArrayBuffer` with space for the header plus all
+      // box data plus all index data. Then `this._boxes` is created as a view
+      // on `this.data` starting after the header and with `numNodes * 4`
+      // elements. `this._indices` is created as a view on `this.data` starting
+      // after the end of `this._boxes`.
     } else {
       this.data = new ArrayBufferType(
         8 + nodesByteSize + numNodes * this.IndexArrayType.BYTES_PER_ELEMENT
@@ -247,15 +299,18 @@ export default class Flatbush {
         numNodes
       );
 
-      // Note that `this._pos` is set to 0. This signifies that no boxes have
-      // yet been added to the index, and it means that the `search` method will
-      // throw until `finish` has been called.
+      // We set `this._pos` to 0. This means that no boxes have
+      // yet been added to the index, and it tells any query methods to throw
+      // until `finish` has been called.
       this._pos = 0;
 
-      // The total bounds of this Flatbush instance is set to `Infinity` values
-      // (i.e. the minimum x/y of any box will be less than positive infinity
-      // and the maximum x/y of any box will be greater than negative infinity)
-      // and will be expanded during each call to `add()` if necessary.
+      // The RTree needs to maintain its total bounds (the global bounding box
+      // of all values) in order to set the bounds for the hilbert space.
+      //
+      // We initialize these bounds to `Infinity` values that will be corrected
+      // when adding data. The minimum x/y of any box will be less than positive
+      // infinity and the maximum x/y of any box will be greater than negative
+      // infinity. The `add()` call will adjust these bounds if necessary.
       this.minX = Infinity;
       this.minY = Infinity;
       this.maxX = -Infinity;
@@ -266,9 +321,9 @@ export default class Flatbush {
       // The first byte, `0xfb` is a "magic byte", used as basic validation that
       // this buffer is indeed a Flatbush index.
       //
-      // Since arrayTypeIndex is known to have only 9 values, it doesn't need to
-      // take up a a full byte. Here it shares a single byte with the Flatbush
-      // format version.
+      // Since `arrayTypeIndex` is known to have only 9 values, it doesn't need
+      // to take up a a full byte. Here it shares a single byte with the
+      // Flatbush format version.
       new Uint8Array(this.data, 0, 2).set([
         0xfb,
         (VERSION << 4) + arrayTypeIndex,
@@ -277,8 +332,9 @@ export default class Flatbush {
       new Uint32Array(this.data, 4, 1)[0] = numItems;
     }
 
-    // A priority queue used for k-nearest-neighbors queries in the `neighbors`
-    // method.
+    // We initialize a [priority
+    // queue](https://en.wikipedia.org/wiki/Priority_queue) used for
+    // k-nearest-neighbors queries in the `neighbors` method.
     /** @type FlatQueue<number> */
     this._queue = new FlatQueue();
   }
@@ -293,7 +349,7 @@ export default class Flatbush {
    * @returns {number} A zero-based, incremental number that represents the newly added rectangle.
    */
   add(minX, minY, maxX, maxY) {
-    // We want to know the insertion index of the box presently being added.
+    // We need to know the insertion index of the box presently being added.
     //
     // In the `constructor`, `this._pos` is initialized to `0` and in each call
     // to `add()`, `this._pos` is incremented by `4`. So dividing `this._pos` by
