@@ -100,7 +100,7 @@ export default class Flatbush {
   // [_transfer_](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects)
   // it between threads much faster than copying it via a [structured
   // clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm).
-  // (Transfering is `O(1)` while cloning is `O(n)`.)
+  // (Transfering is constant-time `O(1)` while cloning is linear-time `O(n)`.)
   //
   // The `from` static method on the class reconstructs a `Flatbush` instance
   // from a raw `ArrayBuffer`.
@@ -418,7 +418,34 @@ export default class Flatbush {
 
   // ### Flatbush.finish
   //
-  // TODO: explain high level of sorting by hilbert curve.
+  // A spatial index needs to sort input data so that elements can be found
+  // quickly later.
+  //
+  // The simplest way of sorting values is on a single dimension, where if `x`
+  // is less than `y`, `x` should be placed before `y`. But that presents a
+  // problem because we have _two_ dimensions, not one. One way to solve this is
+  // to map values from two-dimensional space into a one-dimensional range. A
+  // common way to perform this mapping is to use [space-filling
+  // curves](https://en.wikipedia.org/wiki/Space-filling_curve). In the case of
+  // Flatbush, we'll use a [hilbert
+  // curve](https://en.wikipedia.org/wiki/Hilbert_curve), a specific type of
+  // space-filling curve that's useful with geospatial data because it generally
+  // preserves locality.
+  //
+  // **TODO:** add image from wikipedia of hilbert curve gif.
+  //
+  // Note that using a space-filling curve to map values into one dimension
+  // isn't the only way of sorting multi-dimensional data. There are other
+  // algorithms, like
+  // [sort-tile-recursive (STR)](https://ia600900.us.archive.org/27/items/nasa_techdoc_19970016975/19970016975.pdf)
+  // that first sort into groups on one dimension, then the other, recursively.
+  //
+  // While this canonical Flatbush implementation chooses to sort based on
+  // hilbert value, that's actually not necessary to maintain ABI-stability. Any
+  // two-dimensional sort will work. My [Rust
+  // port](https://github.com/kylebarron/geo-index) defines an [extensible
+  // trait](https://docs.rs/geo-index/latest/geo_index/rtree/sort/trait.Sort.html)
+  // for sorting and provides both hilbert and STR sorting implementations.
   //
   /** Perform indexing of the added rectangles. */
   finish() {
@@ -475,14 +502,6 @@ export default class Flatbush {
     // still in _insertion order_. We need to jointly sort the boxes and indices
     // according to their hilbert values, which we do in this `sort` utility,
     // documented below.
-    //
-    // Note that this canonical implementation chooses to sort based on hilbert
-    // value, but that's actually not necessary to maintain ABI-stability. Any
-    // two-dimensional sort will work. My [Rust
-    // port](https://github.com/kylebarron/geo-index) defines an [extensible
-    // trait](https://docs.rs/geo-index/latest/geo_index/rtree/sort/trait.Sort.html)
-    // for sorting and provides an implementation of [sort-tile-recursive
-    // sorting](https://ia600900.us.archive.org/27/items/nasa_techdoc_19970016975/19970016975.pdf).
     sort(
       hilbertValues,
       boxes,
@@ -499,31 +518,36 @@ export default class Flatbush {
     // `nodeSize` child nodes. We do this starting from the leaves, working from
     // the bottom up.
     //
-    // TODO: resume careful proofreading from here.
-    //
     // Here the iteration variable, `i`, refers to the index into the
-    // `this._levelBounds` array, which is also the positional level of the
-    // tree. So when `i` is `0`, we're iterating over the original geometry
-    // boxes. When `i` is `1`, we're iterating over the parent nodes one level
-    // up that we previously generated from the first loop iteration.
+    // `this._levelBounds` array, which is also the positional **tree level**.
+    //
+    // - When `i == 0`, we're iterating over the original geometry boxes.
+    // - When `i == 1`, we're iterating over the parent nodes one level up that
+    //   we previously generated from the first loop iteration.
+    // - And so on, `i` represents the number of parents from the original
+    //   geometry boxes.
     //
     // As elsewhere, `pos` is a local variable that points to a coordinate
-    // within a box at the given level `i` of the tree.
+    // within a box at the given level `i` of the tree. Note this syntax: it's
+    // unusual for _two_ variables to be defined in the `for` loop binding: here
+    // both `i` and `pos` are only defined within the scope of this loop. But
+    // only `i` is incremented by the loop. `pos` is incremented separately
+    // within the body of the loop (four times for each box).
     for (let i = 0, pos = 0; i < this._levelBounds.length - 1; i++) {
       // Next, we want to scan through all nodes at this level of the tree,
-      // generating a parent node for each block of consecutive `nodeSize`
+      // generating a parent node for each **group** of consecutive `nodeSize`
       // nodes.
       //
       // Here, `end` is index of the first coordinate at the _next level above
-      // the current level_. Therefore, all index values in the range up until
-      // but excluding `end` refer to box coordinates at the current level of
-      // the tree.
+      // the current level_. So the range up to `end` includes all coordinates
+      // at the current tree level.
       //
       // We then scan over all of these box coordinates in this while loop.
       const end = this._levelBounds[i];
       while (pos < end) {
-        // The node index (which will later get set in the `indices` array) is
-        // defined to be the pointer to the first element of a box.
+        // We record the `pos` pointing to the first element of the first box in
+        // each **group** of consecutive `nodeSize` nodes, in order to later
+        // record it in the `indices` array.
         const nodeIndex = pos;
 
         // Calculate the bounding box for the new parent node.
@@ -533,7 +557,8 @@ export default class Flatbush {
         // children of this parent node we're creating.
         //
         // Note the `j = 1` in the loop; this is a small optimization because we
-        // initialize the `node*` variables to the first element.
+        // initialize the `node*` variables to the first element, rather than
+        // initializing with positive and negative infinity.
         //
         // Also note that in the loop we constrain the iteration variable `j` to
         // be both less than the node size and for `pos < end`. The former
@@ -554,6 +579,23 @@ export default class Flatbush {
         // Now that we know the extent of the parent node, we can add the new
         // node's information to the tree data.
         //
+        // Recall that `nodeIndex`, stored above, points to the first element of
+        // the first box in each group of consecutive `nodeSize` nodes.
+        //
+        // The `nodeIndex` is always a multiple of 4 because there are 4
+        // coordinates in each 2D box. This means we can divide by 4 to store
+        // the node index information more compactly. Again, we use `>> 2`
+        // instead of `/ 4` as a performance optimization.
+        //
+        // When we're at the base (leaf) level of the tree, `nodeIndex`
+        // represents the insertion index of the first box in this group.
+        //
+        // Similarly, when we're at higher levels of the tree, `nodeIndex`
+        // represents the offset of the first box in this group.
+        //
+        // These two facts allow us to traverse the tree in a search query, as
+        // we'll see below in `Flatbush.search`.
+        //
         // **TODO**: think a bit more/describe how the
         //
         // ```js
@@ -563,9 +605,13 @@ export default class Flatbush {
         // line works... in particular how is `_indices` laid out across levels?
         // Can you create a diagram of this?
         //
+        //
         // Note that we're setting the parent node into `this._indices` and
-        // `boxes` according to `this._pos`, which **is a different variable
+        // `boxes` according to **`this._pos`**, which **is a different variable
         // than the local `pos` variable that's incremented in this loop.**
+        // `this._pos` is a **global** counter that keeps track of the new nodes
+        // we're **inserting** into the index. In contrast, `pos` is a **local**
+        // counter for aggregating the information for the parent node.
         //
         // Impressively, these loops do all the hard work of constructing the
         // tree! That's it! The structure of the tree and the coordinates of all
