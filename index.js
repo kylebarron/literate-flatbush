@@ -763,11 +763,11 @@ export default class Flatbush {
         // - If the current box _is_ a leaf, then `index` is the original
         //   insertion index, and we add it to the `results` array.
         //
-        // `pos >> 2` is a faster way of expressing `pos / 4`, where we can
-        // inform the JS engine that the output will be an integer.
+        // Again, `pos >> 2` is a faster way of expressing `pos / 4`, where we
+        // can inform the JS engine that the output will be an integer.
         //
         // I believe `| 0` is just a JS engine optimization that doesn't affect
-        // the output of the operation.
+        // the output of the operation?
         //
         // Then we can add the `index` to either the intermediate `queue` or
         // `results` arrays as necessary.
