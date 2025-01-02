@@ -6,6 +6,6 @@
   "scripts": {
     "build": "docco index.js -l classic",
     "upload-gh-pages": "gh-pages -d docs",
-    "watch": "fswatch -o index.js | xargs -n1 -I{} yarn docco index.js"
+    "watch": "watchexec -w index.js yarn build"
   }
 }

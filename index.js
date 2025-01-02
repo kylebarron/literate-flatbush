@@ -1,6 +1,8 @@
 // # Literate Flatbush
 // ## Understanding a fast, elegant RTree implementation
 //
+// **TODO update date**
+//
 // [Kyle Barron](https://kylebarron.dev/) \
 // January 1, 2025 \
 // [Source code](https://github.com/kylebarron/literate-flatbush).
