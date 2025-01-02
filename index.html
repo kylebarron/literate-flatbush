@@ -1,0 +1,1648 @@
+<!DOCTYPE html>
+
+<html>
+<head>
+  <title>Literate Flatbush</title>
+  <meta http-equiv="content-type" content="text/html; charset=UTF-8">
+  <meta name="viewport" content="width=device-width, target-densitydpi=160dpi, initial-scale=1.0, maximum-scale=1.0, user-scalable=0">
+  <link rel="stylesheet" media="all" href="docco.css" />
+</head>
+<body>
+  <div id="container">
+    <div id="background"></div>
+    
+    <ul class="sections">
+        
+        
+        
+        <li id="section-1">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-1">&#x00a7;</a>
+              </div>
+              <h1 id="literate-flatbush">Literate Flatbush</h1>
+<h2 id="understanding-a-fast-elegant-rtree-implementation">Understanding a fast, elegant RTree implementation</h2>
+<p><a href="https://kylebarron.dev/">Kyle Barron</a> <br>January 1, 2025 <br><a href="https://github.com/kylebarron/literate-flatbush">Source code</a>.</p>
+<p><a href="https://blog.mapbox.com/a-dive-into-spatial-search-algorithms-ebd0c5e39d2a">Spatial
+indexes</a>
+are at the core of geospatial software engineering. Given a spatial query
+(“What items are within this <a href="https://en.wikipedia.org/wiki/Minimum_bounding_box">bounding
+box</a>“ or “What are the
+closest items to this point”), they allow for weeding out the vast majority
+of data, making a search massively faster than naively checking all items.</p>
+<p>An <a href="https://en.wikipedia.org/wiki/R-tree"><strong>RTree</strong></a> is one of the most
+common types of spatial indexes. An RTree indexes <a href="https://en.wikipedia.org/wiki/Minimum_bounding_box#Axis-aligned_minimum_bounding_box">axis-aligned bounding
+boxes</a>,
+and so can flexibly manage a variety of <a href="https://datacarpentry.github.io/organization-geospatial/02-intro-vector-data.html">geospatial vector
+data</a>,
+like points, lines, and polygons (by recording the bounding box
+represented by the minimum and maximum extents of a geometry’s coordinates).</p>
+<p><em>But ever wondered how an RTree is actually implemented?</em></p>
+<p>In this post we’ll dive into the implementation of
+<a href="https://github.com/mourner/flatbush">Flatbush</a>, a blazing-fast,
+memory-efficient RTree written in JavaScript by <a href="https://agafonkin.com/">Volodymyr
+Agafonkin</a>. While this implementation is written in
+JavaScript, it’s the <em>algorithm</em> that’s important here. Don’t get too caught
+up in the JavaScript; it should be easy to follow no matter what language
+you’re most familiar with.</p>
+<p>I <a href="https://github.com/kylebarron/geo-index">ported Flatbush to Rust</a> with
+<a href="https://github.com/kylebarron/geo-index/tree/main/python">Python bindings</a>,
+and this post is the result of my efforts to better understand and document
+how the algorithm works.</p>
+<p>This post is a
+<a href="https://en.wikipedia.org/wiki/Literate_programming">“literate”</a> fork of the
+upstream <a href="https://github.com/mourner/flatbush">Flatbush</a> library.
+I’ve added comments to the code, and
+<a href="https://ashkenas.com/docco/">docco</a> is used to generate the HTML file you’re
+reading now. Documentation and code are interspersed, letting you follow
+along with the code. No code modifications have been made in this fork; only
+comments have been added. The source for this fork is
+<a href="https://github.com/kylebarron/literate-flatbush">here</a>.</p>
+<p>All credit for this code included here goes to Volodymyr Agafonkin and other
+contributors to the Flatbush project, forked here under the ISC license. Any
+errors in explanation are mine alone.</p>
+<h2 id="overview">Overview</h2>
+<p>The Flatbush algorithm generates a <strong>static, packed, ABI-stable RTree</strong>.
+Let’s break that down:</p>
+<ul>
+<li><p><a href="https://en.wikipedia.org/wiki/R-tree"><strong>RTree</strong></a>: a spatial index for
+storing geospatial vector data that allows for fast spatial queries.</p>
+<p>It’s a form of a
+<a href="https://en.wikipedia.org/wiki/Tree_(abstract_data_type)">“tree”</a>.
+There’s one root node that has <code>nodeSize</code> children. Each of those nodes
+have their own <code>nodeSize</code> children, and so on. The tree structure allows
+you to avoid superfluous checks and quickly find matching candidates for
+your query. In particular, an RTree stores a <em>bounding box</em> for each
+geometry.</p>
+</li>
+<li><p><strong>static</strong>: the index is immutable. All geometries need to be added to the
+index before any searches can be done. Geometries can’t be added to an
+existing index later.</p>
+</li>
+<li><p><strong>packed</strong>: all nodes are at full capacity (except for the last node at
+each tree level). Because the tree is static, we don’t need to reserve
+space in each node for future additions. This improves memory efficiency.</p>
+</li>
+<li><p><strong>ABI-stable</strong>: the entire tree is stored in a single underlying memory
+buffer, with a well-defined, stable memory layout. This enables zero-copy
+sharing between threads (<a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API">Web
+Workers</a>
+in the browser) or, <a href="https://github.com/kylebarron/geo-index">as in my Rust
+port</a>, between two languages like
+Rust and Python.</p>
+</li>
+</ul>
+<h2 id="why-flatbush">Why Flatbush?</h2>
+<p>There are several nice features about Flatbush:</p>
+<ul>
+<li><strong>Speed</strong>: This is likely the fastest static spatial index in JavaScript. Ports of the algorithm are among the fastest spatial indexes in other languages, too.</li>
+<li><strong>Single, contiguous underlying buffer</strong>: The index is contained in a single <code>ArrayBuffer</code>, which makes it easy to share across multiple threads or persist and use later. In the process of building the index, there are only <strong>two buffer allocations</strong>: one for the main data buffer and a second intermediate one for the hilbert values.</li>
+<li><strong>Memory-efficiency</strong>: because the index is fully packed, it’s highly memory efficient.</li>
+<li><strong>Bounded-memory</strong>: for any given number of items and node size, you can infer the total memory that will be used by the RTree.</li>
+<li><strong>Elegant and concise</strong>: Under 300 lines of JavaScript code and in my opinion it’s quite elegant how the structure of the tree implicitly maintains the insertion index.</li>
+<li>Used as the basis for other projects, like the <a href="https://flatgeobuf.org/">FlatGeobuf</a> geospatial file format.</li>
+</ul>
+<p>What’s not to like? Keep in mind there are a few restrictions:</p>
+<ul>
+<li>Only two-dimensional data. Because the algorithm uses powers of two, only
+two-dimensional data is supported. It can be used with higher-dimensional
+input as long as you only index two of the dimensions.</li>
+<li>The index is immutable. After creating the index, items can no longer be
+added or removed.</li>
+</ul>
+<h2 id="buffer-layout">Buffer layout</h2>
+<p>All bounding box and index data is stored in a single, contiguous buffer,
+with three parts:</p>
+<ul>
+<li>Header: an 8-byte header containing the coordinate array type, node size,
+and number of items.</li>
+<li>Boxes: the bounding box data for each input geometry and intermediate tree
+nodes.</li>
+<li>Indices: An ordering of boxes to allow for traversing the tree and
+retrieving the original insertion index.</li>
+</ul>
+<h2 id="diving-into-the-code">Diving into the code</h2>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-keyword">import</span> <span class="hljs-title class_">FlatQueue</span> <span class="hljs-keyword">from</span> <span class="hljs-string">&quot;flatqueue&quot;</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-2">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-2">&#x00a7;</a>
+              </div>
+              <p>Flatbush supports a variety of
+<a href="https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray"><code>TypedArray</code></a>
+types to store box coordinate data. Flatbush uses <code>Float64Array</code> by default.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-keyword">const</span> <span class="hljs-variable constant_">ARRAY_TYPES</span> = [
+  <span class="hljs-title class_">Int8Array</span>,
+  <span class="hljs-title class_">Uint8Array</span>,
+  <span class="hljs-title class_">Uint8ClampedArray</span>,
+  <span class="hljs-title class_">Int16Array</span>,
+  <span class="hljs-title class_">Uint16Array</span>,
+  <span class="hljs-title class_">Int32Array</span>,
+  <span class="hljs-title class_">Uint32Array</span>,
+  <span class="hljs-title class_">Float32Array</span>,
+  <span class="hljs-title class_">Float64Array</span>,
+];</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-3">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-3">&#x00a7;</a>
+              </div>
+              <p>The Flatbush serialized format version is bumped whenever the binary layout
+of the index changes</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-keyword">const</span> <span class="hljs-variable constant_">VERSION</span> = <span class="hljs-number">3</span>; <span class="hljs-comment">// serialized format version</span>
+
+<span class="hljs-comment">/** <span class="hljs-doctag">@typedef</span> {<span class="hljs-type">Int8ArrayConstructor | Uint8ArrayConstructor | Uint8ClampedArrayConstructor | Int16ArrayConstructor | Uint16ArrayConstructor | Int32ArrayConstructor | Uint32ArrayConstructor | Float32ArrayConstructor | Float64ArrayConstructor</span>} TypedArrayConstructor */</span></pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-4">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-4">&#x00a7;</a>
+              </div>
+              <h2 id="flatbush">Flatbush</h2>
+<p>The <code>Flatbush</code> class is the only export from the Flatbush library. It
+contains functions to create and query the spatial index.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-keyword">export</span> <span class="hljs-keyword">default</span> <span class="hljs-keyword">class</span> <span class="hljs-title class_">Flatbush</span> {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-5">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-5">&#x00a7;</a>
+              </div>
+              <h3 id="flatbushfrom">Flatbush.from</h3>
+<p>One of Flatbush’s goals is to support zero-copy usage, meaning that you can
+take an <code>ArrayBuffer</code> backing a Flatbush index and
+<a href="https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects"><em>transfer</em></a>
+it between threads at virtually zero cost.</p>
+<p>The <code>from</code> static method on the class reconstructs a <code>Flatbush</code> instance
+from a raw <code>ArrayBuffer</code>.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>
+  <span class="hljs-comment">/**
+   * Recreate a Flatbush index from raw `ArrayBuffer` or `SharedArrayBuffer` data.
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">ArrayBuffer | SharedArrayBuffer</span>} <span class="hljs-variable">data</span>
+   * <span class="hljs-doctag">@returns</span> {<span class="hljs-type">Flatbush</span>} <span class="hljs-variable">index</span>
+   */</span>
+  <span class="hljs-keyword">static</span> <span class="hljs-title function_">from</span>(<span class="hljs-params">data</span>) {
+    <span class="hljs-keyword">if</span> (!data || data.<span class="hljs-property">byteLength</span> === <span class="hljs-literal">undefined</span> || data.<span class="hljs-property">buffer</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(
+        <span class="hljs-string">&quot;Data must be an instance of ArrayBuffer or SharedArrayBuffer.&quot;</span>
+      );
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-6">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-6">&#x00a7;</a>
+              </div>
+              <p>The first 8 bytes contain a header:</p>
+<ul>
+<li>byte 1: a “magic byte” set to <code>0xfb</code>.</li>
+<li>byte 2: four bits for the serialized format version and four bits for the array type used for storing coordinates</li>
+<li>byte 3-4: a uint16-encoded number representing the size of each node</li>
+<li>byte 5-8: a uint32-encoded number representing the total number of
+items in the index.</li>
+</ul>
+<p>We read each of these bytes from the provided data buffer, then pass the
+relevant parameters to the class constructor. Because the <code>data</code> argument
+(passed last) is not <code>undefined</code>, the constructor will not create a new
+underlying buffer, but rather reuse the existing buffer.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">const</span> [magic, versionAndType] = <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint8Array</span>(data, <span class="hljs-number">0</span>, <span class="hljs-number">2</span>);
+    <span class="hljs-keyword">if</span> (magic !== <span class="hljs-number">0xfb</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">&quot;Data does not appear to be in a Flatbush format.&quot;</span>);
+    }
+    <span class="hljs-keyword">const</span> version = versionAndType &gt;&gt; <span class="hljs-number">4</span>;
+    <span class="hljs-keyword">if</span> (version !== <span class="hljs-variable constant_">VERSION</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">`Got v<span class="hljs-subst">${version}</span> data when expected v<span class="hljs-subst">${VERSION}</span>.`</span>);
+    }
+    <span class="hljs-keyword">const</span> <span class="hljs-title class_">ArrayType</span> = <span class="hljs-variable constant_">ARRAY_TYPES</span>[versionAndType &amp; <span class="hljs-number">0x0f</span>];
+    <span class="hljs-keyword">if</span> (!<span class="hljs-title class_">ArrayType</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">&quot;Unrecognized array type.&quot;</span>);
+    }
+    <span class="hljs-keyword">const</span> [nodeSize] = <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint16Array</span>(data, <span class="hljs-number">2</span>, <span class="hljs-number">1</span>);
+    <span class="hljs-keyword">const</span> [numItems] = <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint32Array</span>(data, <span class="hljs-number">4</span>, <span class="hljs-number">1</span>);
+
+    <span class="hljs-keyword">return</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Flatbush</span>(numItems, nodeSize, <span class="hljs-title class_">ArrayType</span>, <span class="hljs-literal">undefined</span>, data);
+  }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-7">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-7">&#x00a7;</a>
+              </div>
+              <h3 id="constructor">Constructor</h3>
+<p>The Flatbush constructor initializes the memory space (<code>ArrayBuffer</code>) for a
+Flatbush tree given the number of items the tree will contain and the
+number of elements per tree node.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>  <span class="hljs-comment">/**
+   * Create a Flatbush index that will hold a given number of items.
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">numItems</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} [nodeSize=16] Size of the tree node (16 by default).
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">TypedArrayConstructor</span>} [ArrayType=Float64Array] The array type used for coordinates storage (`Float64Array` by default).
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">ArrayBufferConstructor | SharedArrayBufferConstructor</span>} [ArrayBufferType=ArrayBuffer] The array buffer type used to store data (`ArrayBuffer` by default).
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">ArrayBuffer | SharedArrayBuffer</span>} [data] (Only used internally)
+   */</span>
+  <span class="hljs-title function_">constructor</span>(<span class="hljs-params">
+    numItems,
+    nodeSize = <span class="hljs-number">16</span>,
+    ArrayType = <span class="hljs-built_in">Float64Array</span>,
+    ArrayBufferType = <span class="hljs-built_in">ArrayBuffer</span>,
+    data
+  </span>) {
+    <span class="hljs-keyword">if</span> (numItems === <span class="hljs-literal">undefined</span>)
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">&quot;Missing required argument: numItems.&quot;</span>);
+    <span class="hljs-keyword">if</span> (<span class="hljs-built_in">isNaN</span>(numItems) || numItems &lt;= <span class="hljs-number">0</span>)
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">`Unexpected numItems value: <span class="hljs-subst">${numItems}</span>.`</span>);
+
+    <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span> = +numItems;
+    <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span> = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">min</span>(<span class="hljs-title class_">Math</span>.<span class="hljs-title function_">max</span>(+nodeSize, <span class="hljs-number">2</span>), <span class="hljs-number">65535</span>);</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-8">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-8">&#x00a7;</a>
+              </div>
+              <p>This do-while loop calculates the total number of nodes at each level of
+the R-tree (and thus also the total number of nodes). This will be used
+to allocate space for each level of the tree.</p>
+<p>The tree is <strong>laid out in memory from bottom (leaves) to top (root)</strong>.
+<code>_levelBounds</code> is an array that stores the offset within the coordinates
+array where each level <strong>ends</strong>. The first element of <code>_levelBounds</code> is
+<code>n * 4</code>, meaning that the slice of the coordinates array from <code>0</code> to <code>n * 4</code> contains the bottom (leaves) of the tree.</p>
+<p>Then the slice of the coordinates array from <code>_levelBounds[0]</code> to
+<code>_levelBounds[1]</code> represents the boxes of the first level of the tree,
+that is, the direct parent nodes of the leaves. And so on,
+<code>_levelBounds[1]</code> to <code>_levelBounds[2]</code> represents the nodes at level 2,
+the grandparent nodes of the leaf nodes.</p>
+<p>So for example if <code>numItems</code> is 10,000 and <code>nodeSize</code> is 16,
+<code>levelBounds</code> will be:</p>
+<pre><code>[<span class="hljs-number">40000</span>, <span class="hljs-number">42500</span>, <span class="hljs-number">42660</span>, <span class="hljs-number">42672</span>, <span class="hljs-number">42676</span>]
+</code></pre>
+<p>That is:</p>
+<ul>
+<li>The first 40,000 elements (10,000 nodes) are coordinates of the leaf nodes (4 coordinates per node).</li>
+<li>2,500 coordinates and 625 nodes one level higher</li>
+<li>160 coordinates and 40 nodes two levels higher</li>
+<li>12 coordinates and 3 nodes three levels higher</li>
+<li>1 root node four levels higher, at the top of the tree, with a single 4-coordinate box.</li>
+</ul>
+<p>Keep in mind that because this is a <em>packed</em> tree, every node within a
+single level will be <strong>completely full</strong> (contain exactly <code>nodeSize</code>
+elements) except for the last node.</p>
+<p><code>numNodes</code> ends up as the total number of nodes in the tree, including
+all leaves.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">let</span> n = numItems;
+    <span class="hljs-keyword">let</span> numNodes = n;
+    <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span> = [n * <span class="hljs-number">4</span>];
+    <span class="hljs-keyword">do</span> {
+      n = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">ceil</span>(n / <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span>);
+      numNodes += n;
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span>.<span class="hljs-title function_">push</span>(numNodes * <span class="hljs-number">4</span>);
+    } <span class="hljs-keyword">while</span> (n !== <span class="hljs-number">1</span>);</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-9">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-9">&#x00a7;</a>
+              </div>
+              <p>Flatbush doesn’t manage references to objects directly. Rather, it
+operates in terms of the <em>insertion index</em>. Flatbush only maintains these
+insertion indices.</p>
+<p><code>IndexArrayType</code> will be used to create the <code>indices</code> array, to store the
+ordering of the input boxes. If possible, a <code>Uint16Array</code> will be used to
+save space. If the values would overflow a <code>Uint16Array</code>, a <code>Uint32Array</code>
+is used. The largest number a <code>Uint16Array</code> can hold is <code>2^16 = 65,536</code>.
+Since each node holds four values, this gets divided by <code>4</code> and <code>65,536 / 4 = 16,384</code>. This is why the check here is for 16,384.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-variable language_">this</span>.<span class="hljs-property">ArrayType</span> = <span class="hljs-title class_">ArrayType</span>;
+    <span class="hljs-variable language_">this</span>.<span class="hljs-property">IndexArrayType</span> = numNodes &lt; <span class="hljs-number">16384</span> ? <span class="hljs-title class_">Uint16Array</span> : <span class="hljs-title class_">Uint32Array</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-10">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-10">&#x00a7;</a>
+              </div>
+              <p>In order to accurately interpret the index from raw bytes, we need to
+record in the header which index type we’re using.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">const</span> arrayTypeIndex = <span class="hljs-variable constant_">ARRAY_TYPES</span>.<span class="hljs-title function_">indexOf</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">ArrayType</span>);</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-11">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-11">&#x00a7;</a>
+              </div>
+              <p>The number of bytes needed to store all box coordinate data for all
+nodes.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">const</span> nodesByteSize = numNodes * <span class="hljs-number">4</span> * <span class="hljs-variable language_">this</span>.<span class="hljs-property">ArrayType</span>.<span class="hljs-property">BYTES_PER_ELEMENT</span>;
+
+    <span class="hljs-keyword">if</span> (arrayTypeIndex &lt; <span class="hljs-number">0</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">`Unexpected typed array class: <span class="hljs-subst">${ArrayType}</span>.`</span>);
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-12">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-12">&#x00a7;</a>
+              </div>
+              <p>This <code>if</code> statement switches on whether the <code>data</code> argument was passed in
+(i.e. this constructor is called by <code>Flatbush.from</code>). If <code>data</code> exists,
+this will create the <code>_boxes</code> and <code>_indices</code> arrays as <strong>views</strong> on the
+existing <code>ArrayBuffer</code> without allocating any new memory.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">if</span> (data &amp;&amp; data.<span class="hljs-property">byteLength</span> !== <span class="hljs-literal">undefined</span> &amp;&amp; !data.<span class="hljs-property">buffer</span>) {
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span> = data;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-13">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-13">&#x00a7;</a>
+              </div>
+              <p><code>this._boxes</code> is created as a view on <code>this.data</code> starting after the
+header (8 bytes) and with <code>numNodes * 4</code> elements. <code>this._indices</code> is
+created as a view on <code>this.data</code> starting after the end of
+<code>this._boxes</code> and containing <code>numNodes</code> elements.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span> = <span class="hljs-keyword">new</span> <span class="hljs-variable language_">this</span>.<span class="hljs-title class_">ArrayType</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>, <span class="hljs-number">8</span>, numNodes * <span class="hljs-number">4</span>);
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span> = <span class="hljs-keyword">new</span> <span class="hljs-variable language_">this</span>.<span class="hljs-title class_">IndexArrayType</span>(
+        <span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>,
+        <span class="hljs-number">8</span> + nodesByteSize,
+        numNodes
+      );</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-14">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-14">&#x00a7;</a>
+              </div>
+              <p>The coordinate data in the <code>_boxes</code> array is stored from the leaves up.
+So the last box is the single node that contains all data. The index of
+the last box is the four values in <code>_boxes</code> up to <code>numNodes * 4</code>.</p>
+<p>This sets the total bounds on the <code>Flatbush</code> instance to the extent of
+that box.</p>
+<p>We also set <code>this._pos</code> as the total number of coordinates. <code>this._pos</code>
+is a pointer into the <code>this._boxes</code> array, used while adding new boxes
+to the instance. This also allows for inferring whether the <code>Flatbush</code>
+instance has been “finished” (sorted) or not.</p>
+<p>If the instance has already been sorted, adding more data is not
+allowed. Conversely, if the instance has not yet been sorted, query
+methods may not be called.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> = numNodes * <span class="hljs-number">4</span>;
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span> = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> - <span class="hljs-number">4</span>];
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span> = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> - <span class="hljs-number">3</span>];
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span> = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> - <span class="hljs-number">2</span>];
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span> = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> - <span class="hljs-number">1</span>];</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-15">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-15">&#x00a7;</a>
+              </div>
+              <p>In the <code>else</code> case, a <code>data</code> buffer was not provided, so we need to
+allocate data for the backing buffer.</p>
+<p><code>this.data</code> is a new <code>ArrayBuffer</code> with space for the header plus all
+box data plus all index data. Then <code>this._boxes</code> is created as a view
+on <code>this.data</code> starting after the header and with <code>numNodes * 4</code>
+elements. <code>this._indices</code> is created as a view on <code>this.data</code> starting
+after the end of <code>this._boxes</code>.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    } <span class="hljs-keyword">else</span> {
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span> = <span class="hljs-keyword">new</span> <span class="hljs-title class_">ArrayBufferType</span>(
+        <span class="hljs-number">8</span> + nodesByteSize + numNodes * <span class="hljs-variable language_">this</span>.<span class="hljs-property">IndexArrayType</span>.<span class="hljs-property">BYTES_PER_ELEMENT</span>
+      );
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span> = <span class="hljs-keyword">new</span> <span class="hljs-variable language_">this</span>.<span class="hljs-title class_">ArrayType</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>, <span class="hljs-number">8</span>, numNodes * <span class="hljs-number">4</span>);
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span> = <span class="hljs-keyword">new</span> <span class="hljs-variable language_">this</span>.<span class="hljs-title class_">IndexArrayType</span>(
+        <span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>,
+        <span class="hljs-number">8</span> + nodesByteSize,
+        numNodes
+      );</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-16">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-16">&#x00a7;</a>
+              </div>
+              <p>We set <code>this._pos</code> to 0. This means that no boxes have
+yet been added to the index, and it tells any query methods to throw
+until <code>finish</code> has been called.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> = <span class="hljs-number">0</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-17">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-17">&#x00a7;</a>
+              </div>
+              <p>The RTree needs to maintain its total bounds (the global bounding box
+of all values) in order to set the bounds for the hilbert space.</p>
+<p>We initialize these bounds to <code>Infinity</code> values that will be corrected
+when adding data. The minimum x/y of any box will be less than positive
+infinity and the maximum x/y of any box will be greater than negative
+infinity. The <code>add()</code> call will adjust these bounds if necessary.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span> = <span class="hljs-title class_">Infinity</span>;
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span> = <span class="hljs-title class_">Infinity</span>;
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span> = -<span class="hljs-title class_">Infinity</span>;
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span> = -<span class="hljs-title class_">Infinity</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-18">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-18">&#x00a7;</a>
+              </div>
+              <p>Next we set the header values with metadata from the instance.</p>
+<p>The first byte, <code>0xfb</code> is a “magic byte”, used as basic validation that
+this buffer is indeed a Flatbush index.</p>
+<p>Since <code>arrayTypeIndex</code> is known to have only 9 values, it doesn’t need
+to take up a a full byte. Here it shares a single byte with the
+Flatbush format version.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint8Array</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>, <span class="hljs-number">0</span>, <span class="hljs-number">2</span>).<span class="hljs-title function_">set</span>([
+        <span class="hljs-number">0xfb</span>,
+        (<span class="hljs-variable constant_">VERSION</span> &lt;&lt; <span class="hljs-number">4</span>) + arrayTypeIndex,
+      ]);
+      <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint16Array</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>, <span class="hljs-number">2</span>, <span class="hljs-number">1</span>)[<span class="hljs-number">0</span>] = nodeSize;
+      <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint32Array</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">data</span>, <span class="hljs-number">4</span>, <span class="hljs-number">1</span>)[<span class="hljs-number">0</span>] = numItems;
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-19">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-19">&#x00a7;</a>
+              </div>
+              <p>We initialize a <a href="https://en.wikipedia.org/wiki/Priority_queue">priority
+queue</a> used for
+k-nearest-neighbors queries in the <code>neighbors</code> method.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-comment">/** <span class="hljs-doctag">@type</span> FlatQueue&lt;number&gt; */</span>
+    <span class="hljs-variable language_">this</span>.<span class="hljs-property">_queue</span> = <span class="hljs-keyword">new</span> <span class="hljs-title class_">FlatQueue</span>();
+  }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-20">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-20">&#x00a7;</a>
+              </div>
+              <h3 id="flatbushadd">Flatbush.Add</h3>
+<p>Add a given rectangle to the index.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>  <span class="hljs-comment">/**
+   * Add a given rectangle to the index.
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">minX</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">minY</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">maxX</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">maxY</span>
+   * <span class="hljs-doctag">@returns</span> {<span class="hljs-type">number</span>} A zero-based, incremental number that represents the newly added rectangle.
+   */</span>
+  <span class="hljs-title function_">add</span>(<span class="hljs-params">minX, minY, maxX, maxY</span>) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-21">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-21">&#x00a7;</a>
+              </div>
+              <p>We need to know the insertion index of the box presently being added.</p>
+<p>In the constructor, <code>this._pos</code> is initialized to <code>0</code> and in each call
+to <code>add()</code>, <code>this._pos</code> is incremented by <code>4</code>. Dividing <code>this._pos</code> by
+<code>4</code> retrieves the 0-based index of the box about to be inserted.</p>
+<p>This bit shift:</p>
+<pre><code class="language-js"><span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> &gt;&gt; <span class="hljs-number">2</span>
+</code></pre>
+<p>is equivalent to</p>
+<pre><code class="language-js"><span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> / <span class="hljs-number">4</span>
+</code></pre>
+<p>but the bit shift is faster because it informs the JS engine that we
+expect the output to be an integer.</p>
+<p>Because there are 4 values for each item, using <code>_pos</code> is an easy way to
+infer the insertion index without having to maintain a separate counter.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">const</span> index = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> &gt;&gt; <span class="hljs-number">2</span>;
+    <span class="hljs-keyword">const</span> boxes = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-22">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-22">&#x00a7;</a>
+              </div>
+              <p>We set the value of <code>this._indices</code> at the current index’s position to
+the value of the current index. So <code>this._indices</code> stores the insertion
+index of each box.</p>
+<p>Later, inside the <code>finish</code> method, we’ll sort the boxes by their hilbert
+value and jointly reorder the values in <code>_indices</code>, ensuring that we keep
+the indices and boxes in sync.</p>
+<p>This means that for any box representing a leaf node at position <code>i</code>
+(where <code>i</code> points to a <em>box</em> not a <em>coordinate</em> inside a box),
+<code>this._indices[i]</code> retrieves the original insertion-order index of that
+box.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>[index] = index;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-23">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-23">&#x00a7;</a>
+              </div>
+              <p>We set the coordinates of this box into the <code>boxes</code> array. Note that
+<code>this._pos++</code> is evaluated <strong>after</strong> the box index is set. So</p>
+<pre><code class="language-js">boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = minX;
+</code></pre>
+<p>is equivalent to</p>
+<pre><code class="language-js">boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>] = minX;
+<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> += <span class="hljs-number">1</span>;
+</code></pre>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = minX;
+    boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = minY;
+    boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = maxX;
+    boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = maxY;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-24">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-24">&#x00a7;</a>
+              </div>
+              <p>Update the total bounds of this instance if this rectangle is larger than
+the existing bounds.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">if</span> (minX &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span>) <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span> = minX;
+    <span class="hljs-keyword">if</span> (minY &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span>) <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span> = minY;
+    <span class="hljs-keyword">if</span> (maxX &gt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span>) <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span> = maxX;
+    <span class="hljs-keyword">if</span> (maxY &gt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span>) <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span> = maxY;
+
+    <span class="hljs-keyword">return</span> index;
+  }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-25">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-25">&#x00a7;</a>
+              </div>
+              <h3 id="flatbushfinish">Flatbush.finish</h3>
+<p>A spatial index needs to sort input data so that elements can be found
+quickly later.</p>
+<p>The simplest way of sorting values is on a single dimension, where if <code>a</code>
+is less than <code>b</code>, <code>a</code> should be placed before <code>b</code>. But that presents a
+problem because we have <em>two</em> dimensions, not one.</p>
+<p>One way to solve this is
+to map values from two-dimensional space into a one-dimensional range. A
+common way to perform this mapping is by using <a href="https://en.wikipedia.org/wiki/Space-filling_curve">space-filling
+curves</a>. In our case,
+we’ll use a <a href="https://en.wikipedia.org/wiki/Hilbert_curve">hilbert curve</a>, a
+specific type of space-filling curve that’s useful with geospatial data
+because it generally preserves locality.</p>
+<div style="text-align: center;">
+<img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/Hilbert-curve_rounded-gradient-animated.gif" width="260">
+</div>
+
+<blockquote>
+<p>First six iterations of the Hilbert curve, <a href="https://en.wikipedia.org/wiki/Hilbert_curve#/media/File:Hilbert-curve_rounded-gradient-animated.gif">from
+Wikipedia</a>,
+CC BY-SA.</p>
+</blockquote>
+<p>Note that using a space-filling curve to map values into one dimension
+isn’t the only way of sorting multi-dimensional data. There are other
+algorithms, like
+<a href="https://ia600900.us.archive.org/27/items/nasa_techdoc_19970016975/19970016975.pdf">sort-tile-recursive (STR)</a>
+that first sort into groups on one dimension, then the other, recursively.</p>
+<p>While this canonical Flatbush implementation chooses to sort based on
+hilbert value, that’s actually not necessary to maintain ABI-stability: any
+two-dimensional sort will work. My <a href="https://github.com/kylebarron/geo-index">Rust
+port</a> defines an <a href="https://docs.rs/geo-index/latest/geo_index/rtree/sort/trait.Sort.html">extensible
+trait</a>
+for sorting and provides both hilbert and STR sorting implementations.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>  <span class="hljs-comment">/** Perform indexing of the added rectangles. */</span>
+  <span class="hljs-title function_">finish</span>(<span class="hljs-params"></span>) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-26">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-26">&#x00a7;</a>
+              </div>
+              <p>Recall that in the <code>add</code> method, we increment <code>this._pos</code> by <code>1</code> for each
+coordinate of each box. Here we validate that we’ve added the same number
+of boxes as we provisioned in the constructor. Remember that <code>&gt;&gt; 2</code> is
+equivalent to <code>/ 4</code>.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">if</span> (<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> &gt;&gt; <span class="hljs-number">2</span> !== <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(
+        <span class="hljs-string">`Added <span class="hljs-subst">${<span class="hljs-variable language_">this</span>._pos &gt;&gt; <span class="hljs-number">2</span>}</span> items when expected <span class="hljs-subst">${<span class="hljs-variable language_">this</span>.numItems}</span>.`</span>
+      );
+    }
+    <span class="hljs-keyword">const</span> boxes = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-27">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-27">&#x00a7;</a>
+              </div>
+              <p>If the total number of items in the tree is less than the node size, that
+means we’ll only have a single non-leaf node in the tree. In that case,
+we don’t even need to sort by hilbert value. We can just assign the total
+bounds of the tree to the following box and return.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">if</span> (<span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span> &lt;= <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span>) {
+      boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span>;
+      boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span>;
+      boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span>;
+      boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span>;
+      <span class="hljs-keyword">return</span>;
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-28">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-28">&#x00a7;</a>
+              </div>
+              <p>Using the total bounds of the tree, we compute the height and width of
+the hilbert space and instantiate space for the hilbert values.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">const</span> width = <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxX</span> - <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span> || <span class="hljs-number">1</span>;
+    <span class="hljs-keyword">const</span> height = <span class="hljs-variable language_">this</span>.<span class="hljs-property">maxY</span> - <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span> || <span class="hljs-number">1</span>;
+    <span class="hljs-keyword">const</span> hilbertValues = <span class="hljs-keyword">new</span> <span class="hljs-title class_">Uint32Array</span>(<span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span>);
+    <span class="hljs-keyword">const</span> hilbertMax = (<span class="hljs-number">1</span> &lt;&lt; <span class="hljs-number">16</span>) - <span class="hljs-number">1</span>;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-29">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-29">&#x00a7;</a>
+              </div>
+              <p>Map box centers into Hilbert coordinate space and calculate Hilbert
+values using the <code>hilbert</code> function defined below.</p>
+<p>This for loop iterates over every box. At the beginning of each loop
+iteration, <code>pos</code> is equal to <code>i * 4</code>.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>, pos = <span class="hljs-number">0</span>; i &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span>; i++) {
+      <span class="hljs-keyword">const</span> minX = boxes[pos++];
+      <span class="hljs-keyword">const</span> minY = boxes[pos++];
+      <span class="hljs-keyword">const</span> maxX = boxes[pos++];
+      <span class="hljs-keyword">const</span> maxY = boxes[pos++];
+      <span class="hljs-keyword">const</span> x = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">floor</span>(
+        (hilbertMax * ((minX + maxX) / <span class="hljs-number">2</span> - <span class="hljs-variable language_">this</span>.<span class="hljs-property">minX</span>)) / width
+      );
+      <span class="hljs-keyword">const</span> y = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">floor</span>(
+        (hilbertMax * ((minY + maxY) / <span class="hljs-number">2</span> - <span class="hljs-variable language_">this</span>.<span class="hljs-property">minY</span>)) / height
+      );
+      hilbertValues[i] = <span class="hljs-title function_">hilbert</span>(x, y);
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-30">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-30">&#x00a7;</a>
+              </div>
+              <p>Up until this point, the values in <code>boxes</code> and in <code>this._indices</code> are
+still in <em>insertion order</em>. We now jointly sort the boxes and indices
+according to their hilbert values.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-title function_">sort</span>(
+      hilbertValues,
+      boxes,
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>,
+      <span class="hljs-number">0</span>,
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span> - <span class="hljs-number">1</span>,
+      <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span>
+    );</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-31">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-31">&#x00a7;</a>
+              </div>
+              <p>Now the leaves of the tree have been sorted, but we still need to
+construct the rest of the tree.</p>
+<p>For each level of the tree, we need to generate parent nodes that contain
+<code>nodeSize</code> child nodes. We do this starting from the leaves, working from
+the bottom up.</p>
+<p>Here the iteration variable, <code>i</code>, refers to the positional <strong>tree
+level</strong>, which is also an index into the <code>this._levelBounds</code> array.</p>
+<ul>
+<li>When <code>i == 0</code>, we’re iterating over the original geometry boxes.</li>
+<li>When <code>i == 1</code>, we’re iterating over the parent nodes one level up that
+we previously generated from the first loop iteration.</li>
+<li>And so on, <code>i</code> represents the number of parents from the original
+geometry boxes.</li>
+</ul>
+<p>As elsewhere, <code>pos</code> is a local variable that points to a coordinate
+within a box at the given level <code>i</code> of the tree. Note this syntax: it’s
+unusual for <em>two</em> variables to be defined in the <code>for</code> loop binding: here
+both <code>i</code> and <code>pos</code> are only defined within the scope of this loop. But
+only <code>i</code> is incremented by the loop. <code>pos</code> is incremented separately
+within the body of the loop (four times for each box).</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>, pos = <span class="hljs-number">0</span>; i &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span>.<span class="hljs-property">length</span> - <span class="hljs-number">1</span>; i++) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-32">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-32">&#x00a7;</a>
+              </div>
+              <p>Next, we want to scan through all nodes at this level of the tree,
+generating a parent node for each <strong>group</strong> of consecutive <code>nodeSize</code>
+boxes.</p>
+<p>Here, <code>end</code> is the index of the first coordinate at the <em>next level
+above the current level</em>. So the range up to <code>end</code> includes all
+coordinates at the current tree level.</p>
+<p>We then scan over all of these box coordinates in this while loop.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">const</span> end = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span>[i];
+      <span class="hljs-keyword">while</span> (pos &lt; end) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-33">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-33">&#x00a7;</a>
+              </div>
+              <p>We record the <code>pos</code> pointing to the first element of the first box in
+each <strong>group</strong> of consecutive <code>nodeSize</code> boxes, in order to later
+record it in the <code>indices</code> array.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>        <span class="hljs-keyword">const</span> nodeIndex = pos;</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-34">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-34">&#x00a7;</a>
+              </div>
+              <p>Calculate the bounding box for the new parent node.</p>
+<p>We initialize the bounding box to the first box and then expand the
+box while looping over the rest of the elements that together are the
+children of this parent node we’re creating.</p>
+<p>Note the <code>j = 1</code> in the loop; this is a small optimization because we
+initialize the <code>node*</code> variables to the first element, rather than
+initializing with positive and negative infinity.</p>
+<p>Also note that in the loop we constrain the iteration variable <code>j</code> to
+be both less than the node size and for <code>pos &lt; end</code>. The former
+ensures we have only a maximum of <code>nodeSize</code> elements informing the
+parent node’s boundary. The latter ensures that we don’t accidentally
+overflow the current tree level.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>        <span class="hljs-keyword">let</span> nodeMinX = boxes[pos++];
+        <span class="hljs-keyword">let</span> nodeMinY = boxes[pos++];
+        <span class="hljs-keyword">let</span> nodeMaxX = boxes[pos++];
+        <span class="hljs-keyword">let</span> nodeMaxY = boxes[pos++];
+        <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> j = <span class="hljs-number">1</span>; j &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span> &amp;&amp; pos &lt; end; j++) {
+          nodeMinX = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">min</span>(nodeMinX, boxes[pos++]);
+          nodeMinY = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">min</span>(nodeMinY, boxes[pos++]);
+          nodeMaxX = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">max</span>(nodeMaxX, boxes[pos++]);
+          nodeMaxY = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">max</span>(nodeMaxY, boxes[pos++]);
+        }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-35">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-35">&#x00a7;</a>
+              </div>
+              <p>Now that we know the extent of the parent node, we can add the new
+node’s information to the tree data.</p>
+<p>Recall that <code>nodeIndex</code>, stored above, points to the first element of
+the first box in each group of consecutive <code>nodeSize</code> nodes.</p>
+<p>The <code>nodeIndex</code> is always a multiple of 4 because there are 4
+coordinates in each 2D box. This means we can divide by 4 to store
+the node index information more compactly. Again, we use <code>&gt;&gt; 2</code>
+instead of <code>/ 4</code> as a performance optimization.</p>
+<p>When we’re at the base (leaf) level of the tree, <code>nodeIndex</code>
+represents the insertion index of the first box in this group.</p>
+<p>Similarly, when we’re at higher levels of the tree, <code>nodeIndex</code>
+represents the offset of the first box in this group.</p>
+<p>These two facts allow us to traverse the tree in a search query, as
+we’ll see below in <code>Flatbush.search</code>.</p>
+<p>Note that we’re setting the parent node into <code>this._indices</code> and
+<code>boxes</code> according to <strong><code>this._pos</code></strong>, which <strong>is a different variable
+than the local <code>pos</code> variable that’s incremented in this loop.</strong>
+<code>this._pos</code> is a <strong>global</strong> counter that keeps track of the new nodes
+we’re <strong>inserting</strong> into the index. In contrast, <code>pos</code> is a <strong>local</strong>
+counter for aggregating the information for the parent node.</p>
+<p>Impressively, these loops do all the hard work of constructing the
+tree! That’s it! The structure of the tree and the coordinates of all
+the parent nodes are now fully contained within <code>this._indices</code> and
+<code>boxes</code>, which are both views on <code>this.data</code>!</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>        <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> &gt;&gt; <span class="hljs-number">2</span>] = nodeIndex;
+        boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = nodeMinX;
+        boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = nodeMinY;
+        boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = nodeMaxX;
+        boxes[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span>++] = nodeMaxY;
+      }
+    }
+  }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-36">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-36">&#x00a7;</a>
+              </div>
+              <h3 id="flatbushsearch">Flatbush.search</h3>
+<p>The primary API for searching an index by a bounding box query.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>  <span class="hljs-comment">/**
+   * Search the index by a bounding box.
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">minX</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">minY</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">maxX</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">maxY</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">(index: number) =&gt; boolean</span>} [filterFn] An optional function for filtering the results.
+   * <span class="hljs-doctag">@returns</span> {<span class="hljs-type">number[]</span>} An array of indices of items intersecting or touching the given bounding box.
+   */</span>
+  <span class="hljs-title function_">search</span>(<span class="hljs-params">minX, minY, maxX, maxY, filterFn</span>) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-37">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-37">&#x00a7;</a>
+              </div>
+              <p>A simple check to ensure that this index has been finished/sorted.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">if</span> (<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> !== <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>.<span class="hljs-property">length</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">&quot;Data not yet indexed - call index.finish().&quot;</span>);
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-38">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-38">&#x00a7;</a>
+              </div>
+              <p><code>nodeIndex</code> is initialized to the root node, the parent of all other
+nodes. Since the tree is laid out from bottom to top, the root node is
+the last node in <code>this._boxes</code>. We subtract <code>4</code> so that <code>nodeIndex</code>
+points to the <em>first</em> coordinate of the box.</p>
+<p>Note that <code>nodeIndex</code> will always point to the <strong>first box</strong> within a
+group of (usually <code>nodeSize</code>) boxes.</p>
+<p><code>queue</code> holds integers that represent the position within <code>this._indices</code>
+of intermediate nodes that still need to be searched. That is, <code>queue</code>
+represents nodes whose parents intersected the search predicate.</p>
+<p><code>results</code> holds integers that represent the insertion indexes that match
+the search predicate.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-comment">/** <span class="hljs-doctag">@type</span> number | undefined */</span>
+    <span class="hljs-keyword">let</span> nodeIndex = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>.<span class="hljs-property">length</span> - <span class="hljs-number">4</span>;
+    <span class="hljs-keyword">const</span> queue = [];
+    <span class="hljs-keyword">const</span> results = [];</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-39">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-39">&#x00a7;</a>
+              </div>
+              <p>Now we have our search loop.</p>
+<pre><code class="language-js"><span class="hljs-keyword">while</span> (nodeIndex !== <span class="hljs-literal">undefined</span>)
+</code></pre>
+<p>will be <code>true</code> as long as there are still elements remaining in <code>queue</code>
+(note that the last line of the <code>while</code> loop is <code>nodeIndex = queue.pop();</code>).</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-keyword">while</span> (nodeIndex !== <span class="hljs-literal">undefined</span>) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-40">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-40">&#x00a7;</a>
+              </div>
+              <p>Find the end index of the current node.</p>
+<p>Most of the time, the node contains <code>nodeSize</code> elements. At the end of
+each level, the node will contain fewer elements. In the first case,
+the end of the node will be the current index plus 4 coordinates for
+each box. We check if we’re in the second case by checking the value of
+<code>this._levelBounds</code> for the current level of the tree.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">const</span> end = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">min</span>(
+        nodeIndex + <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span> * <span class="hljs-number">4</span>,
+        <span class="hljs-title function_">upperBound</span>(nodeIndex, <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span>)
+      );</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-41">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-41">&#x00a7;</a>
+              </div>
+              <p>Then we search through each box of the current node, checking whether
+each matches our predicate. The loop ranges from the first node of the
+level (<code>nodeIndex</code>) to the last (<code>end</code>). We increment <code>pos</code> by <code>4</code> for
+each loop step because there are 4 coordinates.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> <span class="hljs-comment">/** <span class="hljs-doctag">@type</span> number */</span> pos = nodeIndex; pos &lt; end; pos += <span class="hljs-number">4</span>) {</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-42">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-42">&#x00a7;</a>
+              </div>
+              <p>Check if the current box <strong>does not intersect</strong> with query box. If
+the current box does not intersect, then we can continue on to the
+next element of this node.</p>
+<p>If we reach past these four lines, then we know the current box
+<strong>does intersect</strong> with the query box.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>        <span class="hljs-keyword">if</span> (maxX &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos]) <span class="hljs-keyword">continue</span>; <span class="hljs-comment">// maxX &lt; nodeMinX</span>
+        <span class="hljs-keyword">if</span> (maxY &lt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">1</span>]) <span class="hljs-keyword">continue</span>; <span class="hljs-comment">// maxY &lt; nodeMinY</span>
+        <span class="hljs-keyword">if</span> (minX &gt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">2</span>]) <span class="hljs-keyword">continue</span>; <span class="hljs-comment">// minX &gt; nodeMaxX</span>
+        <span class="hljs-keyword">if</span> (minY &gt; <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">3</span>]) <span class="hljs-keyword">continue</span>; <span class="hljs-comment">// minY &gt; nodeMaxY</span></pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-43">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-43">&#x00a7;</a>
+              </div>
+              <p><code>pos</code> is a pointer to the first coordinate of the given box.
+Recall in <code>Flatbush.finish</code> that we set:</p>
+<pre><code class="language-js"><span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>[<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> &gt;&gt; <span class="hljs-number">2</span>] = nodeIndex;
+</code></pre>
+<p>This stored a mapping from parent to child node, where <code>this._pos &gt;&gt; 2</code> was the parent node and <code>nodeIndex</code> was the child node. Now is the
+time when we want to use this mapping.</p>
+<ul>
+<li>If the current box <em>is not</em> a leaf, <code>index</code> is the <code>pos</code> of
+the first box of the child node. This child is a node that we
+should evaluate later, so we add it to the <code>queue</code> array.</li>
+<li>If the current box <em>is</em> a leaf, then <code>index</code> is the original
+insertion index, and we add it to the <code>results</code> array.</li>
+</ul>
+<p>Again, <code>pos &gt;&gt; 2</code> is a faster way of expressing <code>pos / 4</code>, where we
+can inform the JS engine that the output will be an integer.</p>
+<p>I believe <code>| 0</code> is just a JS engine optimization that doesn’t affect
+the output of the operation?</p>
+<p>Then we can add the <code>index</code> to either the intermediate <code>queue</code> or
+<code>results</code> arrays as necessary.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>        <span class="hljs-keyword">const</span> index = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>[pos &gt;&gt; <span class="hljs-number">2</span>] | <span class="hljs-number">0</span>;
+
+        <span class="hljs-keyword">if</span> (nodeIndex &gt;= <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span> * <span class="hljs-number">4</span>) {
+          queue.<span class="hljs-title function_">push</span>(index); <span class="hljs-comment">// node; add it to the search queue</span>
+        } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (filterFn === <span class="hljs-literal">undefined</span> || <span class="hljs-title function_">filterFn</span>(index)) {
+          results.<span class="hljs-title function_">push</span>(index); <span class="hljs-comment">// leaf item</span>
+        }
+      }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-44">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-44">&#x00a7;</a>
+              </div>
+              <p>Set the <code>nodeIndex</code> to the next item in the <code>queue</code> so that we continue
+the <code>while</code> loop.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      nodeIndex = queue.<span class="hljs-title function_">pop</span>();
+    }
+
+    <span class="hljs-keyword">return</span> results;
+  }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-45">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-45">&#x00a7;</a>
+              </div>
+              <h3 id="flatbushneighbors">Flatbush.neighbors</h3>
+<p>The primary API for searching an index by nearest neighbors to a point.</p>
+<p>This has significant overlap with <code>Flatbush.search</code>, and so we’ll only
+touch on the differences.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>  <span class="hljs-comment">/**
+   * Search items in order of distance from the given point.
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">x</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">y</span>
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} [maxResults=Infinity]
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} [maxDistance=Infinity]
+   * <span class="hljs-doctag">@param</span> {<span class="hljs-type">(index: number) =&gt; boolean</span>} [filterFn] An optional function for filtering the results.
+   * <span class="hljs-doctag">@returns</span> {<span class="hljs-type">number[]</span>} An array of indices of items found.
+   */</span>
+  <span class="hljs-title function_">neighbors</span>(<span class="hljs-params">x, y, maxResults = <span class="hljs-literal">Infinity</span>, maxDistance = <span class="hljs-literal">Infinity</span>, filterFn</span>) {
+    <span class="hljs-keyword">if</span> (<span class="hljs-variable language_">this</span>.<span class="hljs-property">_pos</span> !== <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>.<span class="hljs-property">length</span>) {
+      <span class="hljs-keyword">throw</span> <span class="hljs-keyword">new</span> <span class="hljs-title class_">Error</span>(<span class="hljs-string">&quot;Data not yet indexed - call index.finish().&quot;</span>);
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-46">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-46">&#x00a7;</a>
+              </div>
+              <p>Instead of using an array as a queue, here we use a priority queue. This
+is a data structure that maintains the queue in sorted order, and which
+allows us to ensure that the first element of the queue is indeed the
+closest to the provided point.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    <span class="hljs-comment">/** <span class="hljs-doctag">@type</span> number | undefined */</span>
+    <span class="hljs-keyword">let</span> nodeIndex = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>.<span class="hljs-property">length</span> - <span class="hljs-number">4</span>;
+    <span class="hljs-keyword">const</span> q = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_queue</span>;
+    <span class="hljs-keyword">const</span> results = [];
+    <span class="hljs-keyword">const</span> maxDistSquared = maxDistance * maxDistance;
+
+    <span class="hljs-attr">outer</span>: <span class="hljs-keyword">while</span> (nodeIndex !== <span class="hljs-literal">undefined</span>) {
+      <span class="hljs-keyword">const</span> end = <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">min</span>(
+        nodeIndex + <span class="hljs-variable language_">this</span>.<span class="hljs-property">nodeSize</span> * <span class="hljs-number">4</span>,
+        <span class="hljs-title function_">upperBound</span>(nodeIndex, <span class="hljs-variable language_">this</span>.<span class="hljs-property">_levelBounds</span>)
+      );</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-47">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-47">&#x00a7;</a>
+              </div>
+              <p>Add child nodes to the queue.</p>
+<p><code>dx</code> and <code>dy</code> are computed as the <em>one-dimensional</em> change in <code>x</code> and
+<code>y</code> needed to reach one of the sides of the box from the query point.
+Then <code>dist</code> is the squared distance to reach the corner of the box
+closest to the query point.</p>
+<p>If this distance is less than the provided maximum distance, we add it
+to the queue. Since we add both intermediate nodes <em>and</em> results to the
+same queue, we need a way to distinguish the two. When the <code>index</code>
+represents an intermediate node, we multiply by two (i.e. <code>&lt;&lt; 1</code>) so
+that we have an even id. When the <code>index</code> represents a leaf item, we
+multiply by two and then add one (i.e. <code>(&lt;&lt; 1) + 1</code>), so that we have
+an odd id.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">for</span> (<span class="hljs-keyword">let</span> pos = nodeIndex; pos &lt; end; pos += <span class="hljs-number">4</span>) {
+        <span class="hljs-keyword">const</span> index = <span class="hljs-variable language_">this</span>.<span class="hljs-property">_indices</span>[pos &gt;&gt; <span class="hljs-number">2</span>] | <span class="hljs-number">0</span>;
+
+        <span class="hljs-keyword">const</span> dx = <span class="hljs-title function_">axisDist</span>(x, <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos], <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">2</span>]);
+        <span class="hljs-keyword">const</span> dy = <span class="hljs-title function_">axisDist</span>(y, <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">1</span>], <span class="hljs-variable language_">this</span>.<span class="hljs-property">_boxes</span>[pos + <span class="hljs-number">3</span>]);
+        <span class="hljs-keyword">const</span> dist = dx * dx + dy * dy;
+        <span class="hljs-keyword">if</span> (dist &gt; maxDistSquared) <span class="hljs-keyword">continue</span>;
+
+        <span class="hljs-keyword">if</span> (nodeIndex &gt;= <span class="hljs-variable language_">this</span>.<span class="hljs-property">numItems</span> * <span class="hljs-number">4</span>) {
+          q.<span class="hljs-title function_">push</span>(index &lt;&lt; <span class="hljs-number">1</span>, dist); <span class="hljs-comment">// node (use even id)</span>
+        } <span class="hljs-keyword">else</span> <span class="hljs-keyword">if</span> (filterFn === <span class="hljs-literal">undefined</span> || <span class="hljs-title function_">filterFn</span>(index)) {
+          q.<span class="hljs-title function_">push</span>((index &lt;&lt; <span class="hljs-number">1</span>) + <span class="hljs-number">1</span>, dist); <span class="hljs-comment">// leaf item (use odd id)</span>
+        }
+      }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-48">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-48">&#x00a7;</a>
+              </div>
+              <p>Now that we’ve added all child nodes to the queue, we can move queue
+items to the results array and/or break out of the outer loop
+completely.</p>
+<p>Since this queue is a priority queue, we can be assured that the first
+item of the queue is the closest to the query point. The nearest corner
+of the box of that item is closer than any other node or result.</p>
+<p>While the <code>queue</code> is non-empty and the first (closest) item in the
+queue is a leaf item (odd), if that item’s distance is less than the
+maximum query distance, we can break out of the outer loop, since there
+cannot be any more nodes that are closer than that distance. If the
+item’s distance is less than the maximum query distance, we add it to
+the results array because it must be the next closest result.</p>
+<p>If the first (closest) item of the <code>queue</code> is an intermediate node (not
+odd), then we need to evaluate the items of that node before knowing
+which one is the next closest. In this case, the <code>while</code> condition is
+<code>false</code>, and we set the <code>nodeIndex</code> to that intermediate node for the
+next iteration of the outer <code>while</code> loop.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>      <span class="hljs-keyword">while</span> (q.<span class="hljs-property">length</span> &amp;&amp; q.<span class="hljs-title function_">peek</span>() &amp; <span class="hljs-number">1</span>) {
+        <span class="hljs-keyword">const</span> dist = q.<span class="hljs-title function_">peekValue</span>();
+        <span class="hljs-keyword">if</span> (dist &gt; maxDistSquared) <span class="hljs-keyword">break</span> outer;
+        results.<span class="hljs-title function_">push</span>(q.<span class="hljs-title function_">pop</span>() &gt;&gt; <span class="hljs-number">1</span>);
+        <span class="hljs-keyword">if</span> (results.<span class="hljs-property">length</span> === maxResults) <span class="hljs-keyword">break</span> outer;
+      }
+
+      nodeIndex = q.<span class="hljs-property">length</span> ? q.<span class="hljs-title function_">pop</span>() &gt;&gt; <span class="hljs-number">1</span> : <span class="hljs-literal">undefined</span>;
+    }</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-49">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-49">&#x00a7;</a>
+              </div>
+              <p>We clear the queue because this queue is reused for all queries in this
+index.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre>    q.<span class="hljs-title function_">clear</span>();
+    <span class="hljs-keyword">return</span> results;
+  }
+}</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-50">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-50">&#x00a7;</a>
+              </div>
+              <p>The remaining code is “just” utility functions.</p>
+<p>I won’t document these in detail because they tend to be self explanatory or
+easily found online and this post is focused more on the RTree implementation
+itself.</p>
+<p><code>axisDist</code>: 1D distance from a value to a range.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-comment">/**
+ * 1D distance from a value to a range.
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">k</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">min</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">max</span>
+ */</span>
+<span class="hljs-keyword">function</span> <span class="hljs-title function_">axisDist</span>(<span class="hljs-params">k, min, max</span>) {
+  <span class="hljs-keyword">return</span> k &lt; min ? min - k : k &lt;= max ? <span class="hljs-number">0</span> : k - max;
+}</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-51">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-51">&#x00a7;</a>
+              </div>
+              <p><code>upperBound</code>: Binary search for the first value in the array bigger than the
+given.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-comment">/**
+ * Binary search for the first value in the array bigger than the given.
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">value</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number[]</span>} <span class="hljs-variable">arr</span>
+ */</span>
+<span class="hljs-keyword">function</span> <span class="hljs-title function_">upperBound</span>(<span class="hljs-params">value, arr</span>) {
+  <span class="hljs-keyword">let</span> i = <span class="hljs-number">0</span>;
+  <span class="hljs-keyword">let</span> j = arr.<span class="hljs-property">length</span> - <span class="hljs-number">1</span>;
+  <span class="hljs-keyword">while</span> (i &lt; j) {
+    <span class="hljs-keyword">const</span> m = (i + j) &gt;&gt; <span class="hljs-number">1</span>;
+    <span class="hljs-keyword">if</span> (arr[m] &gt; value) {
+      j = m;
+    } <span class="hljs-keyword">else</span> {
+      i = m + <span class="hljs-number">1</span>;
+    }
+  }
+  <span class="hljs-keyword">return</span> arr[i];
+}</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-52">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-52">&#x00a7;</a>
+              </div>
+              <p><code>sort</code>: Custom quicksort that partially sorts bbox data alongside the hilbert values.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-comment">/**
+ * Custom quicksort that partially sorts bbox data alongside the hilbert values.
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">Uint32Array</span>} <span class="hljs-variable">values</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">InstanceType&lt;TypedArrayConstructor&gt;</span>} <span class="hljs-variable">boxes</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">Uint16Array | Uint32Array</span>} <span class="hljs-variable">indices</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">left</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">right</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">nodeSize</span>
+ */</span>
+<span class="hljs-keyword">function</span> <span class="hljs-title function_">sort</span>(<span class="hljs-params">values, boxes, indices, left, right, nodeSize</span>) {
+  <span class="hljs-keyword">if</span> (<span class="hljs-title class_">Math</span>.<span class="hljs-title function_">floor</span>(left / nodeSize) &gt;= <span class="hljs-title class_">Math</span>.<span class="hljs-title function_">floor</span>(right / nodeSize)) <span class="hljs-keyword">return</span>;
+
+  <span class="hljs-keyword">const</span> pivot = values[(left + right) &gt;&gt; <span class="hljs-number">1</span>];
+  <span class="hljs-keyword">let</span> i = left - <span class="hljs-number">1</span>;
+  <span class="hljs-keyword">let</span> j = right + <span class="hljs-number">1</span>;
+
+  <span class="hljs-keyword">while</span> (<span class="hljs-literal">true</span>) {
+    <span class="hljs-keyword">do</span> i++;
+    <span class="hljs-keyword">while</span> (values[i] &lt; pivot);
+    <span class="hljs-keyword">do</span> j--;
+    <span class="hljs-keyword">while</span> (values[j] &gt; pivot);
+    <span class="hljs-keyword">if</span> (i &gt;= j) <span class="hljs-keyword">break</span>;
+    <span class="hljs-title function_">swap</span>(values, boxes, indices, i, j);
+  }
+
+  <span class="hljs-title function_">sort</span>(values, boxes, indices, left, j, nodeSize);
+  <span class="hljs-title function_">sort</span>(values, boxes, indices, j + <span class="hljs-number">1</span>, right, nodeSize);
+}</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-53">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-53">&#x00a7;</a>
+              </div>
+              <p><code>swap</code>: Swap two values and two corresponding boxes.</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-comment">/**
+ * Swap two values and two corresponding boxes.
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">Uint32Array</span>} <span class="hljs-variable">values</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">InstanceType&lt;TypedArrayConstructor&gt;</span>} <span class="hljs-variable">boxes</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">Uint16Array | Uint32Array</span>} <span class="hljs-variable">indices</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">i</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">j</span>
+ */</span>
+<span class="hljs-keyword">function</span> <span class="hljs-title function_">swap</span>(<span class="hljs-params">values, boxes, indices, i, j</span>) {
+  <span class="hljs-keyword">const</span> temp = values[i];
+  values[i] = values[j];
+  values[j] = temp;
+
+  <span class="hljs-keyword">const</span> k = <span class="hljs-number">4</span> * i;
+  <span class="hljs-keyword">const</span> m = <span class="hljs-number">4</span> * j;
+
+  <span class="hljs-keyword">const</span> a = boxes[k];
+  <span class="hljs-keyword">const</span> b = boxes[k + <span class="hljs-number">1</span>];
+  <span class="hljs-keyword">const</span> c = boxes[k + <span class="hljs-number">2</span>];
+  <span class="hljs-keyword">const</span> d = boxes[k + <span class="hljs-number">3</span>];
+  boxes[k] = boxes[m];
+  boxes[k + <span class="hljs-number">1</span>] = boxes[m + <span class="hljs-number">1</span>];
+  boxes[k + <span class="hljs-number">2</span>] = boxes[m + <span class="hljs-number">2</span>];
+  boxes[k + <span class="hljs-number">3</span>] = boxes[m + <span class="hljs-number">3</span>];
+  boxes[m] = a;
+  boxes[m + <span class="hljs-number">1</span>] = b;
+  boxes[m + <span class="hljs-number">2</span>] = c;
+  boxes[m + <span class="hljs-number">3</span>] = d;
+
+  <span class="hljs-keyword">const</span> e = indices[i];
+  indices[i] = indices[j];
+  indices[j] = e;
+}</pre></div></div>
+            
+        </li>
+        
+        
+        <li id="section-54">
+            <div class="annotation">
+              
+              <div class="sswrap ">
+                <a class="ss" href="#section-54">&#x00a7;</a>
+              </div>
+              <p><code>hilbert</code>: compute hilbert codes.</p>
+<p>This is the function that takes a position in 2D space, <code>x</code> and <code>y</code>, and
+returns the hilbert value for that position.</p>
+<p>Umm yeah sorry I can’t say anything else about this… it’s black magic.</p>
+<p>Refer to the <a href="https://github.com/rawrunprotected/hilbert_curves">C++ source</a>
+and the <a href="http://threadlocalmutex.com/?p=126">original blog post</a> for any hope
+of understanding what’s going on here!</p>
+
+            </div>
+            
+            <div class="content"><div class='highlight'><pre><span class="hljs-comment">/**
+ * Fast Hilbert curve algorithm by http://threadlocalmutex.com/
+ * Ported from C++ https://github.com/rawrunprotected/hilbert_curves (public domain)
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">x</span>
+ * <span class="hljs-doctag">@param</span> {<span class="hljs-type">number</span>} <span class="hljs-variable">y</span>
+ */</span>
+<span class="hljs-keyword">function</span> <span class="hljs-title function_">hilbert</span>(<span class="hljs-params">x, y</span>) {
+  <span class="hljs-keyword">let</span> a = x ^ y;
+  <span class="hljs-keyword">let</span> b = <span class="hljs-number">0xffff</span> ^ a;
+  <span class="hljs-keyword">let</span> c = <span class="hljs-number">0xffff</span> ^ (x | y);
+  <span class="hljs-keyword">let</span> d = x &amp; (y ^ <span class="hljs-number">0xffff</span>);
+
+  <span class="hljs-keyword">let</span> A = a | (b &gt;&gt; <span class="hljs-number">1</span>);
+  <span class="hljs-keyword">let</span> B = (a &gt;&gt; <span class="hljs-number">1</span>) ^ a;
+  <span class="hljs-keyword">let</span> C = (c &gt;&gt; <span class="hljs-number">1</span>) ^ (b &amp; (d &gt;&gt; <span class="hljs-number">1</span>)) ^ c;
+  <span class="hljs-keyword">let</span> D = (a &amp; (c &gt;&gt; <span class="hljs-number">1</span>)) ^ (d &gt;&gt; <span class="hljs-number">1</span>) ^ d;
+
+  a = A;
+  b = B;
+  c = C;
+  d = D;
+  A = (a &amp; (a &gt;&gt; <span class="hljs-number">2</span>)) ^ (b &amp; (b &gt;&gt; <span class="hljs-number">2</span>));
+  B = (a &amp; (b &gt;&gt; <span class="hljs-number">2</span>)) ^ (b &amp; ((a ^ b) &gt;&gt; <span class="hljs-number">2</span>));
+  C ^= (a &amp; (c &gt;&gt; <span class="hljs-number">2</span>)) ^ (b &amp; (d &gt;&gt; <span class="hljs-number">2</span>));
+  D ^= (b &amp; (c &gt;&gt; <span class="hljs-number">2</span>)) ^ ((a ^ b) &amp; (d &gt;&gt; <span class="hljs-number">2</span>));
+
+  a = A;
+  b = B;
+  c = C;
+  d = D;
+  A = (a &amp; (a &gt;&gt; <span class="hljs-number">4</span>)) ^ (b &amp; (b &gt;&gt; <span class="hljs-number">4</span>));
+  B = (a &amp; (b &gt;&gt; <span class="hljs-number">4</span>)) ^ (b &amp; ((a ^ b) &gt;&gt; <span class="hljs-number">4</span>));
+  C ^= (a &amp; (c &gt;&gt; <span class="hljs-number">4</span>)) ^ (b &amp; (d &gt;&gt; <span class="hljs-number">4</span>));
+  D ^= (b &amp; (c &gt;&gt; <span class="hljs-number">4</span>)) ^ ((a ^ b) &amp; (d &gt;&gt; <span class="hljs-number">4</span>));
+
+  a = A;
+  b = B;
+  c = C;
+  d = D;
+  C ^= (a &amp; (c &gt;&gt; <span class="hljs-number">8</span>)) ^ (b &amp; (d &gt;&gt; <span class="hljs-number">8</span>));
+  D ^= (b &amp; (c &gt;&gt; <span class="hljs-number">8</span>)) ^ ((a ^ b) &amp; (d &gt;&gt; <span class="hljs-number">8</span>));
+
+  a = C ^ (C &gt;&gt; <span class="hljs-number">1</span>);
+  b = D ^ (D &gt;&gt; <span class="hljs-number">1</span>);
+
+  <span class="hljs-keyword">let</span> i0 = x ^ y;
+  <span class="hljs-keyword">let</span> i1 = b | (<span class="hljs-number">0xffff</span> ^ (i0 | a));
+
+  i0 = (i0 | (i0 &lt;&lt; <span class="hljs-number">8</span>)) &amp; <span class="hljs-number">0x00ff00ff</span>;
+  i0 = (i0 | (i0 &lt;&lt; <span class="hljs-number">4</span>)) &amp; <span class="hljs-number">0x0f0f0f0f</span>;
+  i0 = (i0 | (i0 &lt;&lt; <span class="hljs-number">2</span>)) &amp; <span class="hljs-number">0x33333333</span>;
+  i0 = (i0 | (i0 &lt;&lt; <span class="hljs-number">1</span>)) &amp; <span class="hljs-number">0x55555555</span>;
+
+  i1 = (i1 | (i1 &lt;&lt; <span class="hljs-number">8</span>)) &amp; <span class="hljs-number">0x00ff00ff</span>;
+  i1 = (i1 | (i1 &lt;&lt; <span class="hljs-number">4</span>)) &amp; <span class="hljs-number">0x0f0f0f0f</span>;
+  i1 = (i1 | (i1 &lt;&lt; <span class="hljs-number">2</span>)) &amp; <span class="hljs-number">0x33333333</span>;
+  i1 = (i1 | (i1 &lt;&lt; <span class="hljs-number">1</span>)) &amp; <span class="hljs-number">0x55555555</span>;
+
+  <span class="hljs-keyword">return</span> ((i1 &lt;&lt; <span class="hljs-number">1</span>) | i0) &gt;&gt;&gt; <span class="hljs-number">0</span>;
+}</pre></div></div>
+            
+        </li>
+        
+    </ul>
+  </div>
+</body>
+</html>
