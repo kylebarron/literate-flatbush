@@ -2,69 +2,105 @@
 // ## Understanding a fast, elegant RTree implementation
 //
 // [Kyle Barron](https://kylebarron.dev/) \
-// January 1, 2025
+// January 1, 2025 \
+// [Source code](https://github.com/kylebarron/literate-flatbush).
 //
-// Spatial indexes are a tried and true part of geospatial software engineering that speed up queries. But ever wondered how an RTree is actually implemented?
+// [Spatial
+// indexes](https://blog.mapbox.com/a-dive-into-spatial-search-algorithms-ebd0c5e39d2a)
+// are at the core of geospatial software engineering. Given a spatial query
+// ("What items are within this [bounding
+// box](https://en.wikipedia.org/wiki/Minimum_bounding_box)" or "What are the
+// closest items to this point"), they allow for weeding out the vast majority
+// of data, making a search massively faster than naively checking all items.
 //
-// TODO: fix this intro.
-// TODO: somewhere in intro explain what a hilbert curve is.
+// An [**RTree**](https://en.wikipedia.org/wiki/R-tree) is one of the most
+// common types of spatial indexes. An RTree indexes [axis-aligned bounding
+// boxes](https://en.wikipedia.org/wiki/Minimum_bounding_box#Axis-aligned_minimum_bounding_box),
+// and so can flexibly manage a variety of [geospatial vector
+// data](https://datacarpentry.github.io/organization-geospatial/02-intro-vector-data.html),
+// like points, lines, and polygons (by recording the bounding box
+// represented by the minimum and maximum extents of a geometry's coordinates).
 //
-// This post is a ["literate"](https://en.wikipedia.org/wiki/Literate_programming) fork of Flatbush, a blazing-fast, memory-efficient RTree. Documentation and code are interspersed, letting you follow along with the code.
+// _But ever wondered how an RTree is actually implemented?_
 //
-// The code in this particular post is in JavaScript, because that's what the canonical implementation uses. But it's the _algorithm_ that's important here, so don't get too caught up in the JavaScript.
+// In this post we'll dive into the implementation of
+// [Flatbush](https://github.com/mourner/flatbush), a blazing-fast,
+// memory-efficient RTree written in JavaScript by [Volodymyr
+// Agafonkin](https://agafonkin.com/). While this implementation is written in
+// JavaScript, it's the _algorithm_ that's important here. Don't get too caught
+// up in the JavaScript; it should be easy to follow no matter what language
+// you're most familiar with.
+//
+// I [ported Flatbush to Rust](https://github.com/kylebarron/geo-index) with
+// [Python bindings](https://github.com/kylebarron/geo-index/tree/main/python),
+// and this post is the result of my efforts to better understand and document
+// how the algorithm works.
+//
+// This post is a
+// ["literate"](https://en.wikipedia.org/wiki/Literate_programming) fork of the
+// upstream [Flatbush](https://github.com/mourner/flatbush) library.
+// I've added comments to the code, and
+// [docco](https://ashkenas.com/docco/) is used to generate the HTML file you're
+// reading now. Documentation and code are interspersed, letting you follow
+// along with the code. No code modifications have been made in this fork; only
+// comments have been added. The source for this fork is
+// [here](https://github.com/kylebarron/literate-flatbush).
+//
+// All credit for this code included here goes to Volodymyr Agafonkin and other
+// contributors to the Flatbush project, forked here under the ISC license. Any
+// errors in explanation are mine alone.
 //
 // ## Overview
 //
 // The Flatbush algorithm generates a **static, packed, ABI-stable RTree**.
 // Let's break that down:
 //
-// - [**RTree**](https://en.wikipedia.org/wiki/R-tree): a [spatial
-//   index](https://blog.mapbox.com/a-dive-into-spatial-search-algorithms-ebd0c5e39d2a)
-//   for storing geospatial vector data that allows for fast spatial queries.
+// - [**RTree**](https://en.wikipedia.org/wiki/R-tree): a spatial index for
+//   storing geospatial vector data that allows for fast spatial queries.
 //
 //   It's a form of a
-//   ["tree"](https://en.wikipedia.org/wiki/Tree_(abstract_data_type)), where
-//   there's one root node that has `nodeSize` children. Each of those nodes
+//   ["tree"](https://en.wikipedia.org/wiki/Tree_(abstract_data_type)).
+//   There's one root node that has `nodeSize` children. Each of those nodes
 //   have their own `nodeSize` children, and so on. The tree structure allows
 //   you to avoid superfluous checks and quickly find matching candidates for
 //   your query. In particular, an RTree stores a _bounding box_ for each
 //   geometry.
-// - **static**: the index is immutable. All geometries need to be added to the index before any searches can be done. Geometries can't be added to an existing index later.
-// - **packed**: all nodes are at full capacity (except for the last node at each tree level). Because the tree is static, we don't need to reserve space in each node for future additions. This improves memory efficiency.
-// - **ABI-stable**: the underlying binary memory layout is stable. This enables zero-copy sharing between threads or, in my Rust port, between Rust and Python.
 //
-// There are a few really nice features about this algorithm, and why it makes
-// sense to document it like this:
+// - **static**: the index is immutable. All geometries need to be added to the
+//   index before any searches can be done. Geometries can't be added to an
+//   existing index later.
+//
+// - **packed**: all nodes are at full capacity (except for the last node at
+//   each tree level). Because the tree is static, we don't need to reserve
+//   space in each node for future additions. This improves memory efficiency.
+//
+// - **ABI-stable**: the entire tree is stored in a single underlying memory
+//   buffer, with a well-defined, stable memory layout. This enables zero-copy
+//   sharing between threads ([Web
+//   Workers](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API)
+//   in the browser) or, [as in my Rust
+//   port](https://github.com/kylebarron/geo-index), between two languages like
+//   Rust and Python.
+//
+// ## Why Flatbush?
+//
+// There are several nice features about Flatbush:
 //
 // - **Speed**: This is likely the fastest static spatial index in JavaScript. Ports of the algorithm are among the fastest spatial indexes in other languages, too.
-// - **Single, contiguous underlying buffer**: The index is contained in a single `ArrayBuffer`, which makes it easy to share across multiple threads or persist and use later.
+// - **Single, contiguous underlying buffer**: The index is contained in a single `ArrayBuffer`, which makes it easy to share across multiple threads or persist and use later. In the process of building the index, there are only **two buffer allocations**: one for the main data buffer and a second intermediate one for the hilbert values.
 // - **Memory-efficiency**: because the index is fully packed, it's highly memory efficient.
 // - **Bounded-memory**: for any given number of items and node size, you can infer the total memory that will be used by the RTree.
-// - **Simple and elegant**: The JavaScript implementation is just a few hundred lines of code, and in my opinion it's quite elegant how the structure of the tree implicitly maintains the insertion index.
+// - **Elegant and concise**: Under 300 lines of JavaScript code and in my opinion it's quite elegant how the structure of the tree implicitly maintains the insertion index.
+// - Used as the basis for other projects, like the [FlatGeobuf](https://flatgeobuf.org/) geospatial file format.
 //
-// Keep in mind there are a few restrictions as well:
+// What's not to like? Keep in mind there are a few restrictions:
 //
-// - Only two-dimensional data. Because the algorithm uses powers of two, only two-dimensional data is supported.
+// - Only two-dimensional data. Because the algorithm uses powers of two, only
+//   two-dimensional data is supported. It can be used with higher-dimensional
+//   input as long as you only index two of the dimensions.
+// - The index is immutable. After creating the index, items can no longer be
+//   added or removed.
 //
-//
-//
-// I've written _two_ ports of Flatbush. I originally explored a (now-archived)
-// [Cython port](https://github.com/kylebarron/pyflatbush) but deprecated that
-// in favor of writing a [stable, fast, implementation in
-// Rust](https://github.com/kylebarron/geo-index), with [Python
-// bindings](https://github.com/kylebarron/geo-index/tree/main/python).
-//
-// This is a "literate" fork of the [`flatbush`][] library. Markdown-formatted
-// comments are written in the code, and then
-// [`docco`](https://ashkenas.com/docco/) converts the file into a rendered HTML
-// file. No code modifications are made in this fork. Only comments are added.
-//
-// All credit for this code goes to Volodymyr Agafonkin and contributors to the
-// [`flatbush`][] project, forked here under the ISC license. Any errors in
-// explanation are mine alone.
-//
-// [`flatbush`]: https://github.com/mourner/flatbush
-
 import FlatQueue from "flatqueue";
 
 // Flatbush supports a variety of
