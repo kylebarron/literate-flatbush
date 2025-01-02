@@ -101,11 +101,24 @@
 // - The index is immutable. After creating the index, items can no longer be
 //   added or removed.
 //
+// ## Buffer layout
+//
+// All bounding box and index data is stored in a single, contiguous buffer,
+// with three parts:
+//
+// - Header: an 8-byte header containing the coordinate array type, node size,
+//   and number of items.
+// - Boxes: the bounding box data for each input geometry and intermediate tree
+//   nodes.
+// - Indices: An ordering of boxes to allow for traversing the tree and
+//   retrieving the original insertion index.
+//
+// ## Diving into the code
 import FlatQueue from "flatqueue";
 
 // Flatbush supports a variety of
 // [`TypedArray`](https://developer.mozilla.org/en-US/docs/Web/JavaScript/Reference/Global_Objects/TypedArray)
-// types store box coordinate data. Flatbush uses `Float64Array` by default.
+// types to store box coordinate data. Flatbush uses `Float64Array` by default.
 const ARRAY_TYPES = [
   Int8Array,
   Uint8Array,
@@ -134,9 +147,7 @@ export default class Flatbush {
   // One of Flatbush's goals is to support zero-copy usage, meaning that you can
   // take an `ArrayBuffer` backing a Flatbush index and
   // [_transfer_](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Transferable_objects)
-  // it between threads much faster than copying it via a [structured
-  // clone](https://developer.mozilla.org/en-US/docs/Web/API/Web_Workers_API/Structured_clone_algorithm).
-  // (Transfering is constant-time `O(1)` while cloning is linear-time `O(n)`.)
+  // it between threads at virtually zero cost.
   //
   // The `from` static method on the class reconstructs a `Flatbush` instance
   // from a raw `ArrayBuffer`.
@@ -153,14 +164,18 @@ export default class Flatbush {
       );
     }
 
-    // The first 8 bytes of the Flatbush buffer contain a header with metadata
-    // describing the contained index.
+    // The first 8 bytes contain a header:
     //
     // - byte 1: a "magic byte" set to `0xfb`.
-    // - byte 2: 4 bits for the serialized format version and four bits for the array type used for storing coordinates
+    // - byte 2: four bits for the serialized format version and four bits for the array type used for storing coordinates
     // - byte 3-4: a uint16-encoded number representing the size of each node
     // - byte 5-8: a uint32-encoded number representing the total number of
     //   items in the index.
+    //
+    // We read each of these bytes from the provided data buffer, then pass the
+    // relevant parameters to the class constructor. Because the `data` argument
+    // (passed last) is not `undefined`, the constructor will not create a new
+    // underlying buffer, but rather reuse the existing buffer.
     const [magic, versionAndType] = new Uint8Array(data, 0, 2);
     if (magic !== 0xfb) {
       throw new Error("Data does not appear to be in a Flatbush format.");
@@ -176,10 +191,6 @@ export default class Flatbush {
     const [nodeSize] = new Uint16Array(data, 2, 1);
     const [numItems] = new Uint32Array(data, 4, 1);
 
-    // Given the above parsed metadata about the index, pass these to the
-    // constructor. Because the `data` argument (passed last) is not
-    // `undefined`, the constructor will not create a new underlying buffer, but
-    // rather reuse the existing buffer.
     return new Flatbush(numItems, nodeSize, ArrayType, undefined, data);
   }
 
@@ -213,19 +224,19 @@ export default class Flatbush {
 
     // This do-while loop calculates the total number of nodes at each level of
     // the R-tree (and thus also the total number of nodes). This will be used
-    // to know the amount of bytes to allocate for each level of the tree.
+    // to allocate space for each level of the tree.
     //
-    // The tree is laid out in memory from bottom to top. `_levelBounds` is an
-    // array that stores the offset within the coordinates array where each
-    // level **ends**. The first element of `_levelBounds` is `n * 4`, meaning
-    // that the slice of the coordinates array from `0` to `n * 4` contains the
-    // bottom (leaves) of the tree.
+    // The tree is **laid out in memory from bottom (leaves) to top (root)**.
+    // `_levelBounds` is an array that stores the offset within the coordinates
+    // array where each level **ends**. The first element of `_levelBounds` is
+    // `n * 4`, meaning that the slice of the coordinates array from `0` to `n *
+    // 4` contains the bottom (leaves) of the tree.
     //
     // Then the slice of the coordinates array from `_levelBounds[0]` to
-    // `_levelBounds[1]` represents the first level of the tree, that is, the
-    // direct parent nodes of the leaves. And so on, `_levelBounds[1]` to
-    // `_levelBounds[2]` represents the nodes at level 2, the grandparent nodes
-    // of the leaf nodes.
+    // `_levelBounds[1]` represents the boxes of the first level of the tree,
+    // that is, the direct parent nodes of the leaves. And so on,
+    // `_levelBounds[1]` to `_levelBounds[2]` represents the nodes at level 2,
+    // the grandparent nodes of the leaf nodes.
     //
     // So for example if `numItems` is 10,000 and `nodeSize` is 16,
     // `levelBounds` will be:
@@ -234,7 +245,7 @@ export default class Flatbush {
     // ```
     //
     // That is:
-    // - The first 40,000 elements are coordinates of the leaf nodes (4 coordinates per node). So there are 10,000 leaves.
+    // - The first 40,000 elements (10,000 nodes) are coordinates of the leaf nodes (4 coordinates per node).
     // - 2,500 coordinates and 625 nodes one level higher
     // - 160 coordinates and 40 nodes two levels higher
     // - 12 coordinates and 3 nodes three levels higher
@@ -256,8 +267,8 @@ export default class Flatbush {
     } while (n !== 1);
 
     // Flatbush doesn't manage references to objects directly. Rather, it
-    // operates in terms of the _insertion index_. So Flatbush only internally
-    // maintains these insertion indices.
+    // operates in terms of the _insertion index_. Flatbush only maintains these
+    // insertion indices.
     //
     // `IndexArrayType` will be used to create the `indices` array, to store the
     // ordering of the input boxes. If possible, a `Uint16Array` will be used to
@@ -310,9 +321,9 @@ export default class Flatbush {
       // to the instance. This also allows for inferring whether the `Flatbush`
       // instance has been "finished" (sorted) or not.
       //
-      // If the instance has already been sorted, it's impermissible to add more
-      // data. If the instance has not yet been sorted, query methods may not
-      // be called.
+      // If the instance has already been sorted, adding more data is not
+      // allowed. Conversely, if the instance has not yet been sorted, query
+      // methods may not be called.
       this._pos = numNodes * 4;
       this.minX = this._boxes[this._pos - 4];
       this.minY = this._boxes[this._pos - 3];
@@ -355,7 +366,7 @@ export default class Flatbush {
       this.maxX = -Infinity;
       this.maxY = -Infinity;
 
-      // These lines set the header values with metadata from the instance.
+      // Next we set the header values with metadata from the instance.
       //
       // The first byte, `0xfb` is a "magic byte", used as basic validation that
       // this buffer is indeed a Flatbush index.
@@ -379,6 +390,8 @@ export default class Flatbush {
   }
 
   // ### Flatbush.Add
+  //
+  // Add a given rectangle to the index.
   /**
    * Add a given rectangle to the index.
    * @param {number} minX
@@ -457,18 +470,25 @@ export default class Flatbush {
   // A spatial index needs to sort input data so that elements can be found
   // quickly later.
   //
-  // The simplest way of sorting values is on a single dimension, where if `x`
-  // is less than `y`, `x` should be placed before `y`. But that presents a
-  // problem because we have _two_ dimensions, not one. One way to solve this is
-  // to map values from two-dimensional space into a one-dimensional range. A
-  // common way to perform this mapping is to use [space-filling
-  // curves](https://en.wikipedia.org/wiki/Space-filling_curve). In the case of
-  // Flatbush, we'll use a [hilbert
-  // curve](https://en.wikipedia.org/wiki/Hilbert_curve), a specific type of
-  // space-filling curve that's useful with geospatial data because it generally
-  // preserves locality.
+  // The simplest way of sorting values is on a single dimension, where if `a`
+  // is less than `b`, `a` should be placed before `b`. But that presents a
+  // problem because we have _two_ dimensions, not one.
   //
-  // **TODO:** add image from wikipedia of hilbert curve gif.
+  // One way to solve this is
+  // to map values from two-dimensional space into a one-dimensional range. A
+  // common way to perform this mapping is by using [space-filling
+  // curves](https://en.wikipedia.org/wiki/Space-filling_curve). In our case,
+  // we'll use a [hilbert curve](https://en.wikipedia.org/wiki/Hilbert_curve), a
+  // specific type of space-filling curve that's useful with geospatial data
+  // because it generally preserves locality.
+  //
+  // <div style="text-align: center;">
+  // <img src="https://upload.wikimedia.org/wikipedia/commons/7/7c/Hilbert-curve_rounded-gradient-animated.gif" width="260">
+  // </div>
+  //
+  // > First six iterations of the Hilbert curve, [from
+  // > Wikipedia](https://en.wikipedia.org/wiki/Hilbert_curve#/media/File:Hilbert-curve_rounded-gradient-animated.gif),
+  // > CC BY-SA.
   //
   // Note that using a space-filling curve to map values into one dimension
   // isn't the only way of sorting multi-dimensional data. There are other
@@ -477,7 +497,7 @@ export default class Flatbush {
   // that first sort into groups on one dimension, then the other, recursively.
   //
   // While this canonical Flatbush implementation chooses to sort based on
-  // hilbert value, that's actually not necessary to maintain ABI-stability. Any
+  // hilbert value, that's actually not necessary to maintain ABI-stability: any
   // two-dimensional sort will work. My [Rust
   // port](https://github.com/kylebarron/geo-index) defines an [extensible
   // trait](https://docs.rs/geo-index/latest/geo_index/rtree/sort/trait.Sort.html)
@@ -535,9 +555,8 @@ export default class Flatbush {
     }
 
     // Up until this point, the values in `boxes` and in `this._indices` are
-    // still in _insertion order_. We need to jointly sort the boxes and indices
-    // according to their hilbert values, which we do in this `sort` utility,
-    // documented below.
+    // still in _insertion order_. We now jointly sort the boxes and indices
+    // according to their hilbert values.
     sort(
       hilbertValues,
       boxes,
@@ -554,8 +573,8 @@ export default class Flatbush {
     // `nodeSize` child nodes. We do this starting from the leaves, working from
     // the bottom up.
     //
-    // Here the iteration variable, `i`, refers to the index into the
-    // `this._levelBounds` array, which is also the positional **tree level**.
+    // Here the iteration variable, `i`, refers to the positional **tree
+    // level**, which is also an index into the `this._levelBounds` array.
     //
     // - When `i == 0`, we're iterating over the original geometry boxes.
     // - When `i == 1`, we're iterating over the parent nodes one level up that
@@ -572,17 +591,17 @@ export default class Flatbush {
     for (let i = 0, pos = 0; i < this._levelBounds.length - 1; i++) {
       // Next, we want to scan through all nodes at this level of the tree,
       // generating a parent node for each **group** of consecutive `nodeSize`
-      // nodes.
+      // boxes.
       //
-      // Here, `end` is index of the first coordinate at the _next level above
-      // the current level_. So the range up to `end` includes all coordinates
-      // at the current tree level.
+      // Here, `end` is the index of the first coordinate at the _next level
+      // above the current level_. So the range up to `end` includes all
+      // coordinates at the current tree level.
       //
       // We then scan over all of these box coordinates in this while loop.
       const end = this._levelBounds[i];
       while (pos < end) {
         // We record the `pos` pointing to the first element of the first box in
-        // each **group** of consecutive `nodeSize` nodes, in order to later
+        // each **group** of consecutive `nodeSize` boxes, in order to later
         // record it in the `indices` array.
         const nodeIndex = pos;
 
@@ -631,16 +650,6 @@ export default class Flatbush {
         //
         // These two facts allow us to traverse the tree in a search query, as
         // we'll see below in `Flatbush.search`.
-        //
-        // **TODO**: think a bit more/describe how the
-        //
-        // ```js
-        // this._indices[this._pos >> 2] = nodeIndex;
-        // ```
-        //
-        // line works... in particular how is `_indices` laid out across levels?
-        // Can you create a diagram of this?
-        //
         //
         // Note that we're setting the parent node into `this._indices` and
         // `boxes` according to **`this._pos`**, which **is a different variable
