@@ -627,6 +627,8 @@ export default class Flatbush {
   }
 
   // ### Flatbush.search
+  //
+  // The primary API for searching an index by a bounding box query.
   /**
    * Search the index by a bounding box.
    * @param {number} minX
@@ -642,16 +644,20 @@ export default class Flatbush {
       throw new Error("Data not yet indexed - call index.finish().");
     }
 
-    // `nodeIndex` is initialized to the root node. The root node is the last
-    // node in `this._boxes`. We subtract `4` so that `nodeIndex` points to the
-    // first coordinate of the box.
+    // `nodeIndex` is initialized to the root node, the parent of all other
+    // nodes. Since the tree is laid out from bottom to top, the root node is
+    // the last node in `this._boxes`. We subtract `4` so that `nodeIndex`
+    // points to the _first_ coordinate of the box.
     //
-    // `queue` holds integers that represent the `pos` of internal nodes that
-    // still need to be searched. That is, where the parent node of the node
-    // represented by `pos` intersected the search predicate.
+    // Note that `nodeIndex` will always point to the **first box** within a
+    // group of (usually `nodeSize`) boxes.
     //
-    // `results` holds integers that represent the insertion indexes of index rows
-    // that match the search predicate.
+    // `queue` holds integers that represent the position within `this._indices`
+    // of intermediate nodes that still need to be searched. That is, `queue`
+    // represents nodes whose parents intersected the search predicate.
+    //
+    // `results` holds integers that represent the insertion indexes that match
+    // the search predicate.
     /** @type number | undefined */
     let nodeIndex = this._boxes.length - 4;
     const queue = [];
@@ -659,39 +665,67 @@ export default class Flatbush {
 
     // Now we have our search loop.
     //
-    // `while (nodeIndex !== undefined)` will be `true` as long as there are
-    // still elements remaining in `queue` (note that the last line of the
-    // `while` loop is `nodeIndex = queue.pop();`).
+    // ```js
+    // while (nodeIndex !== undefined)
+    // ```
+    //
+    // will be `true` as long as there are still elements remaining in `queue`
+    // (note that the last line of the `while` loop is `nodeIndex =
+    // queue.pop();`).
     while (nodeIndex !== undefined) {
-      // find the end index of the node
+      // Find the end index of the current node.
+      //
+      // Most of the time, the node contains `nodeSize` elements. At the end of
+      // each level, the node will contain fewer elements. In the first case,
+      // the end of the node will be the current index plus 4 coordinates for
+      // each box. We check if we're in the second case by checking the value of
+      // `this._levelBounds` for the current level of the tree.
       const end = Math.min(
         nodeIndex + this.nodeSize * 4,
         upperBound(nodeIndex, this._levelBounds)
       );
 
-      // search through child nodes
+      // Then we search through each box of the current node, checking whether
+      // each matches our predicate. The loop ranges from the first node of the
+      // level (`nodeIndex`) to the last (`end`). We increment `pos` by `4` for
+      // each loop step because there are 4 coordinates.
       for (let /** @type number */ pos = nodeIndex; pos < end; pos += 4) {
-        // check if node bbox intersects with query bbox
+        // Check if the current box **does not intersect** with query box. If
+        // the current box does not intersect, then we can continue on to the
+        // next element of this node.
+        //
+        // If we reach past these four lines, then we know the current box
+        // **does intersect** with the query box.
         if (maxX < this._boxes[pos]) continue; // maxX < nodeMinX
         if (maxY < this._boxes[pos + 1]) continue; // maxY < nodeMinY
         if (minX > this._boxes[pos + 2]) continue; // minX > nodeMaxX
         if (minY > this._boxes[pos + 3]) continue; // minY > nodeMaxY
 
-        // `pos` is a pointer to the first coordinate of a given node.
-        // `pos` has multiple purposes. In the
+        // `pos` is a pointer to the first coordinate of the given box.
+        // Recall in `Flatbush.finish` that we set:
+        //
+        // ```js
+        // this._indices[this._pos >> 2] = nodeIndex;
+        // ```
+        //
+        // This stored a mapping from parent to child node, where `this._pos >>
+        // 2` was the parent node and `nodeIndex` was the child node. Now is the
+        // time when we want to use this mapping.
+        //
+        // - If the current box _is not_ a leaf, `index` is the `pos` of
+        //   the first box of the child node. This child is a node that we
+        //   should evaluate later, so we add it to the `queue` array.
+        // - If the current box _is_ a leaf, then `index` is the original
+        //   insertion index, and we add it to the `results` array.
         //
         // `pos >> 2` is a faster way of expressing `pos / 4`, where we can
         // inform the JS engine that the output will be an integer.
         //
-        // - If the current node _is not_ a leaf node, `index` is the `pos` of
-        //   the first child node. This is a node that we should evaluate later,
-        //   so we add it to the `queue` array.
-        // - If the current node _is_ a leaf node, then `index` is the original
-        //   insertion index, and we add it to the `results` array.
+        // I believe `| 0` is just a JS engine optimization that doesn't affect
+        // the output of the operation.
         //
-        // Each box has 4 coordinates, and recall that the
-        //
-        // I believe `| 0` is just a JS engine optimization.
+        // Then we can add the `index` to either the intermediate `queue` or
+        // `results` arrays as necessary.
         const index = this._indices[pos >> 2] | 0;
 
         if (nodeIndex >= this.numItems * 4) {
@@ -701,12 +735,20 @@ export default class Flatbush {
         }
       }
 
+      // Set the `nodeIndex` to the next item in the `queue` so that we continue
+      // the `while` loop.
       nodeIndex = queue.pop();
     }
 
     return results;
   }
 
+  // ### Flatbush.neighbors
+  //
+  // The primary API for searching an index by nearest neighbors to a point.
+  //
+  // This has significant overlap with `Flatbush.search`, and so we'll only
+  // touch on the differences.
   /**
    * Search items in order of distance from the given point.
    * @param {number} x
@@ -717,11 +759,14 @@ export default class Flatbush {
    * @returns {number[]} An array of indices of items found.
    */
   neighbors(x, y, maxResults = Infinity, maxDistance = Infinity, filterFn) {
-    // A simple check to ensure that this index has been finished/sorted.
     if (this._pos !== this._boxes.length) {
       throw new Error("Data not yet indexed - call index.finish().");
     }
 
+    // Instead of using an array as a queue, here we use a priority queue. This
+    // is a data structure that maintains the queue in sorted order, and which
+    // allows us to ensure that the first element of the queue is indeed the
+    // closest to the provided point.
     /** @type number | undefined */
     let nodeIndex = this._boxes.length - 4;
     const q = this._queue;
@@ -729,13 +774,25 @@ export default class Flatbush {
     const maxDistSquared = maxDistance * maxDistance;
 
     outer: while (nodeIndex !== undefined) {
-      // find the end index of the node
       const end = Math.min(
         nodeIndex + this.nodeSize * 4,
         upperBound(nodeIndex, this._levelBounds)
       );
 
-      // add child nodes to the queue
+      // Add child nodes to the queue.
+      //
+      // `dx` and `dy` are computed as the _one-dimensional_ change in `x` and
+      // `y` needed to reach one of the sides of the box from the query point.
+      // Then `dist` is the squared distance to reach the corner of the box
+      // closest to the query point.
+      //
+      // If this distance is less than the provided maximum distance, we add it
+      // to the queue. Since we add both intermediate nodes _and_ results to the
+      // same queue, we need a way to distinguish the two. When the `index`
+      // represents an intermediate node, we multiply by two (i.e. `<< 1`) so
+      // that we have an even id. When the `index` represents a leaf item, we
+      // multiply by two and then add one (i.e. `(<< 1) + 1`), so that we have
+      // an odd id.
       for (let pos = nodeIndex; pos < end; pos += 4) {
         const index = this._indices[pos >> 2] | 0;
 
@@ -751,7 +808,26 @@ export default class Flatbush {
         }
       }
 
-      // pop items from the queue
+      // Now that we've added all child nodes to the queue, we can move queue
+      // items to the results array and/or break out of the outer loop
+      // completely.
+      //
+      // Since this queue is a priority queue, we can be assured that the first
+      // item of the queue is the closest to the query point. The nearest corner
+      // of the box of that item is closer than any other node or result.
+      //
+      // While the `queue` is non-empty and the first (closest) item in the
+      // queue is a leaf item (odd), if that item's distance is less than the
+      // maximum query distance, we can break out of the outer loop, since there
+      // cannot be any more nodes that are closer than that distance. If the
+      // item's distance is less than the maximum query distance, we add it to
+      // the results array because it must be the next closest result.
+      //
+      // If the first (closest) item of the `queue` is an intermediate node (not
+      // odd), then we need to evaluate the items of that node before knowing
+      // which one is the next closest. In this case, the `while` condition is
+      // `false`, and we set the `nodeIndex` to that intermediate node for the
+      // next iteration of the outer `while` loop.
       while (q.length && q.peek() & 1) {
         const dist = q.peekValue();
         if (dist > maxDistSquared) break outer;
@@ -762,6 +838,8 @@ export default class Flatbush {
       nodeIndex = q.length ? q.pop() >> 1 : undefined;
     }
 
+    // We clear the queue because this queue is reused for all queries in this
+    // index.
     q.clear();
     return results;
   }
@@ -769,8 +847,11 @@ export default class Flatbush {
 
 // The remaining code is "just" utility functions.
 //
-// I won't document these because they tend to be self explanatory and this post
-// is focused more on the RTree implementation itself.
+// I won't document these in detail because they tend to be self explanatory or
+// easily found online and this post is focused more on the RTree implementation
+// itself.
+//
+// `axisDist`: 1D distance from a value to a range.
 /**
  * 1D distance from a value to a range.
  * @param {number} k
@@ -781,6 +862,8 @@ function axisDist(k, min, max) {
   return k < min ? min - k : k <= max ? 0 : k - max;
 }
 
+// `upperBound`: Binary search for the first value in the array bigger than the
+// given.
 /**
  * Binary search for the first value in the array bigger than the given.
  * @param {number} value
