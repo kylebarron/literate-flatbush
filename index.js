@@ -1,10 +1,8 @@
 // # Literate Flatbush
 // ## Understanding a fast, elegant RTree implementation
 //
-// **TODO update date**
-//
 // [Kyle Barron](https://kylebarron.dev/) \
-// January 1, 2025 \
+// January 8, 2025 \
 // [Source code](https://github.com/kylebarron/literate-flatbush).
 //
 // [Spatial
@@ -34,9 +32,9 @@
 // you're most familiar with.
 //
 // I [ported Flatbush to Rust](https://github.com/kylebarron/geo-index) with
-// [Python bindings](https://github.com/kylebarron/geo-index/tree/main/python),
-// and this post is the result of my efforts to better understand and document
-// how the algorithm works.
+// [Python bindings](https://kylebarron.dev/geo-index), and this post is the
+// result of my efforts to better understand and document how the algorithm
+// works.
 //
 // This post is a
 // ["literate"](https://en.wikipedia.org/wiki/Literate_programming) fork of the
