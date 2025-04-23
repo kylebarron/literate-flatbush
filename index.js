@@ -862,7 +862,7 @@ export default class Flatbush {
       // of the box of that item is closer than any other node or result.
       //
       // While the `queue` is non-empty and the first (closest) item in the
-      // queue is a leaf item (odd), if that item's distance is less than the
+      // queue is a leaf item (odd), if that item's distance is more than the
       // maximum query distance, we can break out of the outer loop, since there
       // cannot be any more nodes that are closer than that distance. If the
       // item's distance is less than the maximum query distance, we add it to
